@@ -57,7 +57,7 @@ func TestGCPConfigEncryptOnly(t *testing.T) {
 	assert.Zero(t, keeper.decrypts.Load())
 
 	keeper.allowDecrypt = true
-	manager, err := newCloudSecretsManagerWithKeeper(testGCPKMSURL, wrappedStackKey, keeper)
+	manager, err := newCloudSecretsManagerWithKeeper(ctx, testGCPKMSURL, wrappedStackKey, keeper)
 	require.NoError(t, err)
 	legacy, err := manager.Encrypter().EncryptValue(ctx, "legacy")
 	require.NoError(t, err)
@@ -66,7 +66,7 @@ func TestGCPConfigEncryptOnly(t *testing.T) {
 
 	// Read both versions in a fresh manager, without relying on its plaintext cache.
 	mixedCaseURL := strings.Replace(testGCPKMSURL, "gcpkms", "GcpKms", 1)
-	reader, err := newCloudSecretsManagerWithKeeper(mixedCaseURL, wrappedStackKey, keeper)
+	reader, err := newCloudSecretsManagerWithKeeper(ctx, mixedCaseURL, wrappedStackKey, keeper)
 	require.NoError(t, err)
 	plaintexts, err := reader.Decrypter().BatchDecrypt(ctx, []string{legacy, ciphertexts[0]})
 	require.NoError(t, err)
@@ -77,7 +77,7 @@ func TestGCPConfigEncryptOnly(t *testing.T) {
 
 	_, otherStackKey, err := newWrappedDataKey(ctx, keeper)
 	require.NoError(t, err)
-	otherStack, err := newCloudSecretsManagerWithKeeper(testGCPKMSURL, otherStackKey, keeper)
+	otherStack, err := newCloudSecretsManagerWithKeeper(ctx, testGCPKMSURL, otherStackKey, keeper)
 	require.NoError(t, err)
 	_, err = otherStack.Decrypter().DecryptValue(ctx, ciphertexts[0])
 	require.ErrorContains(t, err, "message authentication failed")
@@ -99,7 +99,7 @@ func TestGCPConfigInitializesStackKeyWithoutDecryption(t *testing.T) {
 	keeper.allowDecrypt = true
 	stackKey, err := base64.StdEncoding.DecodeString(ps.EncryptedKey)
 	require.NoError(t, err)
-	reader, err := newCloudSecretsManagerWithKeeper(testGCPKMSURL, stackKey, keeper)
+	reader, err := newCloudSecretsManagerWithKeeper(ctx, testGCPKMSURL, stackKey, keeper)
 	require.NoError(t, err)
 	plaintext, err := reader.Decrypter().DecryptValue(ctx, ciphertext)
 	require.NoError(t, err)

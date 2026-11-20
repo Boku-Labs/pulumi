@@ -19,9 +19,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	netUrl "net/url"
 	"os"
+	"path"
 	"strings"
 
 	gosecrets "gocloud.dev/secrets"
@@ -73,6 +75,22 @@ func openKeeper(ctx context.Context, url string) (*gosecrets.Keeper, error) {
 	}
 }
 
+// OpenCloudSecretsManager opens the key recorded in stack configuration without changing it.
+func OpenCloudSecretsManager(ctx context.Context, ps *workspace.ProjectStack) (secrets.Manager, error) {
+	if ps.SecretsProvider == "" || ps.EncryptedKey == "" {
+		return nil, errors.New("stack configuration has no wrapped cloud secrets key")
+	}
+	key, err := base64.StdEncoding.DecodeString(ps.EncryptedKey)
+	if err != nil {
+		return nil, fmt.Errorf("decoding wrapped stack key: %w", err)
+	}
+	keeper, err := openKeeper(ctx, ps.SecretsProvider)
+	if err != nil {
+		return nil, err
+	}
+	return newCloudSecretsManagerWithKeeper(ctx, ps.SecretsProvider, key, keeper)
+}
+
 // newCloudSecretsManager returns a secrets manager that uses the target cloud key management
 // service to encrypt/decrypt a data key used for envelope encryption of secrets values.
 func newCloudSecretsManager(url string, encryptedDataKey []byte) (*Manager, error) {
@@ -80,10 +98,12 @@ func newCloudSecretsManager(url string, encryptedDataKey []byte) (*Manager, erro
 	if err != nil {
 		return nil, err
 	}
-	return newCloudSecretsManagerWithKeeper(url, encryptedDataKey, keeper)
+	return newCloudSecretsManagerWithKeeper(context.Background(), url, encryptedDataKey, keeper)
 }
 
-func newCloudSecretsManagerWithKeeper(url string, encryptedDataKey []byte, keeper dataKeyUnwrapper) (*Manager, error) {
+func newCloudSecretsManagerWithKeeper(
+	ctx context.Context, url string, encryptedDataKey []byte, keeper dataKeyUnwrapper,
+) (*Manager, error) {
 	// We're emulating gocloud.dev's old behaviour here. Pre v0.28.0 it used to have an inner wrapping, which
 	// we keep for compatibility (see above). However the newer version expects this to be unwrapped, before
 	// it's used, so let's do that here.
@@ -95,7 +115,7 @@ func newCloudSecretsManagerWithKeeper(url string, encryptedDataKey []byte, keepe
 		}
 		ciphertext = decoded
 	}
-	plaintextDataKey, err := keeper.Decrypt(context.Background(), ciphertext)
+	plaintextDataKey, err := keeper.Decrypt(ctx, ciphertext)
 	if err != nil {
 		return nil, err
 	}
@@ -191,26 +211,51 @@ func effectiveCloudSecretsProvider(provider string) string {
 	if override == "" || override == provider {
 		return provider
 	}
-	configured := parseGCPKMSProvider(provider)
-	replacement := parseGCPKMSProvider(override)
-	if configured != nil && replacement != nil && configured.String() == replacement.String() {
+	configuredName, configuredAAD, configuredOK := gcpKMSProviderIdentity(provider)
+	replacementName, replacementAAD, replacementOK := gcpKMSProviderIdentity(override)
+	if configuredOK && replacementOK && configuredName == replacementName && configuredAAD == replacementAAD {
 		return provider
 	}
 	return override
+}
+
+func gcpKMSProviderIdentity(provider string) (name, aad string, ok bool) {
+	u := parseGCPKMSProvider(provider)
+	if u == nil {
+		return "", "", false
+	}
+	query, err := netUrl.ParseQuery(u.RawQuery)
+	if err != nil {
+		return "", "", false
+	}
+	for key := range query {
+		if key != "additional_authenticated_data" {
+			return "", "", false
+		}
+	}
+	data, err := base64.URLEncoding.DecodeString(query.Get("additional_authenticated_data"))
+	if err != nil {
+		return "", "", false
+	}
+	// The Cloud KMS driver joins the host and path to form the resource name.
+	return path.Join(u.Host, u.Path), string(data), true
 }
 
 func newCloudSecretsManagerForStack(
 	info *workspace.ProjectStack, secretsProvider string, rotateSecretsProvider bool,
 	open func(context.Context, string) (*gosecrets.Keeper, error),
 ) (secrets.Manager, error) {
-	// Only passphrase secrets providers use an encryption salt.
-	info.EncryptionSalt = ""
-	secretsProvider = effectiveCloudSecretsProvider(secretsProvider)
+	configuredProvider := secretsProvider
+	secretsProvider = effectiveCloudSecretsProvider(configuredProvider)
 
 	// Decode an existing wrapped key before opening the keeper.
 	ctx := context.Background()
 	dataKey, err := base64.StdEncoding.DecodeString(info.EncryptedKey)
 	needsNewKey := rotateSecretsProvider || info.EncryptedKey == "" || info.SecretsProvider != secretsProvider
+	usingConfiguredProvider := !rotateSecretsProvider && configuredProvider == info.SecretsProvider
+	if needsNewKey && usingConfiguredProvider && info.Config.HasSecureValue() {
+		return nil, errors.New("cannot replace the wrapped stack key while encrypted configuration exists")
+	}
 	if !needsNewKey && err != nil {
 		return nil, err
 	}
@@ -230,11 +275,12 @@ func newCloudSecretsManagerForStack(
 		}
 	}
 
-	sm, err := newCloudSecretsManagerWithKeeper(secretsProvider, dataKey, keeper)
+	sm, err := newCloudSecretsManagerWithKeeper(ctx, secretsProvider, dataKey, keeper)
 	if err != nil {
 		return nil, err
 	}
 	info.SecretsProvider = secretsProvider
+	info.EncryptionSalt = ""
 	if needsNewKey {
 		info.EncryptedKey = base64.StdEncoding.EncodeToString(dataKey)
 	}

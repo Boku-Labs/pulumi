@@ -17,6 +17,7 @@ package config
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/stack"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	"github.com/pulumi/pulumi/pkg/v3/secrets/cloud"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/esc"
@@ -600,6 +602,40 @@ func TestCopyConfig(t *testing.T) {
 		assert.Contains(t, envImports, "test")
 		assert.NotContains(t, envImports, "test2")
 	})
+}
+
+func TestCopyPlaintextConfigDoesNotLoadKMS(t *testing.T) {
+	t.Parallel()
+
+	key := config.MustMakeKey("project", "name")
+	source := &workspace.ProjectStack{Config: config.Map{key: config.NewValue("plaintext")}}
+	loader := stack.SecretsManagerLoader{
+		OpenConfigKMSKeeper: func(context.Context, string) (cloud.ConfigKMSKeeper, error) {
+			return nil, errors.New("KMS must not be opened for plaintext")
+		},
+	}
+	destination := func() *workspace.ProjectStack {
+		return &workspace.ProjectStack{
+			SecretsProvider: "gcpkms://projects/example/locations/global/keyRings/test/cryptoKeys/test",
+			Config:          make(config.Map),
+		}
+	}
+
+	bulk := destination()
+	changed, err := stack.CopyEntireConfigMap(t.Context(), loader, nil, source, nil, bulk)
+	require.NoError(t, err)
+	require.True(t, changed)
+	assert.Equal(t, source.Config, bulk.Config)
+	assert.Empty(t, bulk.EncryptedKey)
+
+	single := destination()
+	path := filepath.Join(t.TempDir(), "Pulumi.dev.yaml")
+	err = copySingleConfigKey(t.Context(), loader, key.String(), false, nil, source, nil, single, path)
+	require.NoError(t, err)
+	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), &workspace.Project{Name: "project"}, path)
+	require.NoError(t, err)
+	assert.Equal(t, source.Config, saved.Config)
+	assert.Empty(t, saved.EncryptedKey)
 }
 
 func TestOpenStackEnvDiags(t *testing.T) {

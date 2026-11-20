@@ -17,6 +17,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/display"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
+	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
@@ -479,9 +481,25 @@ func configSecretsForRedaction(ctx context.Context, cfg config.Map, decrypter co
 	}
 	decrypted, err := secureConfig.AsDecryptedPropertyMap(ctx, decrypter)
 	if err != nil {
-		if len(secureConfig) == 1 {
-			for key := range secureConfig {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		// The batch error may not identify an item. Retry by key to report a
+		// specific failure without decrypting healthy batches twice.
+		contextual := secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter}
+		for key, value := range secureConfig {
+			if len(secureConfig) == 1 {
 				return nil, DecryptError{Key: key, Err: err}
+			}
+			_, itemErr := value.SecureValues(contextual)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if itemErr != nil {
+				return nil, DecryptError{Key: key, Err: itemErr}
 			}
 		}
 		return nil, fmt.Errorf("failed to decrypt configuration secrets: %w", err)

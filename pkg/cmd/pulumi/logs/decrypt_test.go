@@ -17,17 +17,35 @@ package logs
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/pulumi/pulumi/pkg/v3/backend"
+	cmdBackend "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/backend"
+	"github.com/pulumi/pulumi/pkg/v3/engine/encryptedlog"
+	"github.com/pulumi/pulumi/pkg/v3/secrets/cloud"
+	"github.com/pulumi/pulumi/pkg/v3/util/testutil"
+	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	ptesting "github.com/pulumi/pulumi/sdk/v3/go/common/testing"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	gosecrets "gocloud.dev/secrets"
+	"gocloud.dev/secrets/driver"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -53,6 +71,122 @@ func TestDecryptGzipLog(t *testing.T) {
 
 	stdout, _ := e.RunCommand("pulumi", "logs", "decrypt", logFile)
 	assert.Equal(t, content, stdout)
+}
+
+func TestDecryptAndShareLogWithConfigKey(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	t.Chdir(dir)
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", "unused://override")
+
+	const scheme = "log-test-kms"
+	const provider = scheme + "://config-key"
+	gosecrets.DefaultURLMux().RegisterKeeper(scheme, logConfigKeeperOpener{})
+	project := &workspace.Project{
+		Name:    "log-test",
+		Runtime: workspace.NewProjectRuntimeInfo("go", nil),
+	}
+	require.NoError(t, project.Save("Pulumi.yaml"))
+
+	key := bytes.Repeat([]byte{1}, config.SymmetricCrypterKeyBytes)
+	stackConfig := workspace.ProjectStack{
+		SecretsProvider: provider,
+		EncryptedKey:    base64.StdEncoding.EncodeToString(key),
+	}
+	require.NoError(t, stackConfig.Save("Pulumi.dev.yaml"))
+	configBefore, err := os.ReadFile("Pulumi.dev.yaml")
+	require.NoError(t, err)
+
+	ref := &backend.MockStackReference{NameV: tokens.MustParseStackName("dev")}
+	var checkpoint *apitype.UntypedDeployment
+	b := &backend.MockBackend{
+		ExportDeploymentF: func(context.Context, backend.Stack) (*apitype.UntypedDeployment, error) {
+			return checkpoint, nil
+		},
+	}
+	stack := &backend.MockStack{
+		RefF:            func() backend.StackReference { return ref },
+		BackendF:        func() backend.Backend { return b },
+		ConfigLocationF: func() backend.StackConfigLocation { return backend.StackConfigLocation{} },
+	}
+	b.GetStackF = func(context.Context, backend.StackReference) (backend.Stack, error) { return stack, nil }
+	testutil.MockLoginManager(t, &cmdBackend.MockLoginManager{
+		LoginF: func(
+			context.Context, pkgWorkspace.Context, diag.Sink, string,
+			*workspace.Project, bool, bool, colors.Colorization, ...cmdBackend.LoginOption,
+		) (backend.Backend, error) {
+			return b, nil
+		},
+	})
+	ws := &pkgWorkspace.MockContext{
+		ReadProjectF: func(string) (*workspace.Project, string, error) { return project, dir, nil },
+	}
+
+	const record = "saved before deployment\n"
+	const name = "dev-20260401T120000.log"
+	f, err := os.Create(name)
+	require.NoError(t, err)
+	prepared, err := encryptedlog.PrepareKey(ctx, config.NewSymmetricCrypter(key))
+	require.NoError(t, err)
+	writer, err := encryptedlog.NewWriterFromKey(f, prepared)
+	require.NoError(t, err)
+	_, err = io.WriteString(writer, record)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	require.NoError(t, f.Close())
+
+	staleKey, err := json.Marshal(map[string]any{
+		"url":          provider,
+		"encryptedkey": make([]byte, config.SymmetricCrypterKeyBytes),
+	})
+	require.NoError(t, err)
+	stale, err := json.Marshal(apitype.DeploymentV3{
+		SecretsProviders: &apitype.SecretsProvidersV1{Type: cloud.Type, State: staleKey},
+	})
+	require.NoError(t, err)
+	//nolint:paralleltest // the log commands share a working directory and mock backend
+	for _, tc := range []struct {
+		name  string
+		state *apitype.UntypedDeployment
+	}{
+		{name: "no checkpoint"},
+		{name: "stale checkpoint", state: &apitype.UntypedDeployment{Version: 3, Deployment: stale}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checkpoint = tc.state
+			var out bytes.Buffer
+			cmd := newDecryptCmd(ws)
+			cmd.SetOut(&out)
+			cmd.SetArgs([]string{name})
+			require.NoError(t, cmd.ExecuteContext(t.Context()))
+			assert.Equal(t, record, out.String())
+
+			file, err := os.Open(name)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, file.Close()) })
+			outPath := filepath.Join(t.TempDir(), "shared.log")
+			require.NoError(t, sharePLOG(t.Context(), ws, "dev", file, outPath, "session", key, true))
+			shared, err := os.ReadFile(outPath)
+			require.NoError(t, err)
+			assert.True(t, bytes.HasPrefix(shared, []byte(encryptedlog.Magic)))
+			assert.NotContains(t, string(shared), record)
+		})
+	}
+	saved, err := os.ReadFile("Pulumi.dev.yaml")
+	require.NoError(t, err)
+	assert.Equal(t, configBefore, saved)
+}
+
+type logConfigKeeperOpener struct{}
+
+func (logConfigKeeperOpener) OpenKeeperURL(context.Context, *url.URL) (*gosecrets.Keeper, error) {
+	return gosecrets.NewKeeper(logConfigKeeper{}), nil
+}
+
+type logConfigKeeper struct{ driver.Keeper }
+
+func (logConfigKeeper) Decrypt(_ context.Context, key []byte) ([]byte, error) {
+	return key, nil
 }
 
 func TestFormatLogRecordsFoldsArgs(t *testing.T) {

@@ -406,7 +406,8 @@ func copySingleConfigKey(
 	destinationProjectStack *workspace.ProjectStack,
 	configFile string,
 ) error {
-	var decrypter config.Decrypter
+	var decrypter config.Decrypter = config.NewPanicCrypter()
+	var encrypter config.Encrypter = config.NewPanicCrypter()
 	key, err := ParseConfigKey(pkgWorkspace.Instance, configKey, path)
 	if err != nil {
 		return fmt.Errorf("invalid configuration key: %w", err)
@@ -429,13 +430,11 @@ func copySingleConfigKey(
 			state == cmdStack.SecretsManagerUnchanged,
 			"We're reading a secure value so the encryption information must be present already",
 		)
-	} else {
-		decrypter = config.NewPanicCrypter()
-	}
 
-	encrypter, _, cerr := ssml.GetEncrypter(ctx, destinationStack, destinationProjectStack)
-	if cerr != nil {
-		return cerr
+		encrypter, _, err = ssml.GetEncrypter(ctx, destinationStack, destinationProjectStack)
+		if err != nil {
+			return err
+		}
 	}
 
 	val, err := v.Copy(

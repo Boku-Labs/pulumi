@@ -531,15 +531,19 @@ func TestLanguageHostDiagnostics(t *testing.T) {
 }
 
 type brokenDecrypter struct {
-	ErrorMessage string
+	ErrorMessage     string
+	BrokenCiphertext string
 }
 
-func (b brokenDecrypter) DecryptValue(_ context.Context, _ string) (string, error) {
-	return "", errors.New(b.ErrorMessage)
+func (b brokenDecrypter) DecryptValue(_ context.Context, ciphertext string) (string, error) {
+	if ciphertext == b.BrokenCiphertext {
+		return "", errors.New(b.ErrorMessage)
+	}
+	return ciphertext, nil
 }
 
-func (b brokenDecrypter) BatchDecrypt(_ context.Context, _ []string) ([]string, error) {
-	return nil, errors.New(b.ErrorMessage)
+func (b brokenDecrypter) BatchDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
+	return config.DefaultBatchDecrypt(ctx, b, ciphertexts)
 }
 
 // Tests that the engine presents a reasonable error message when a decrypter fails to decrypt a config value.
@@ -559,10 +563,11 @@ func TestBrokenDecrypter(t *testing.T) {
 	key := config.MustMakeKey("foo", "bar")
 	msg := "decryption failed"
 	configMap := make(config.Map)
-	configMap[key] = config.NewSecureValue("hunter2")
+	configMap[key] = config.NewSecureValue("broken")
+	configMap[config.MustMakeKey("foo", "readable")] = config.NewSecureValue("readable")
 	p := &lt.TestPlan{
 		Options:   lt.TestUpdateOptions{T: t, HostF: hostF},
-		Decrypter: brokenDecrypter{ErrorMessage: msg},
+		Decrypter: brokenDecrypter{ErrorMessage: msg, BrokenCiphertext: "broken"},
 		Config:    configMap,
 		Steps: []lt.TestStep{{
 			Op:            Update,

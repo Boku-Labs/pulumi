@@ -95,6 +95,9 @@ func newGCPConfigEncrypter(
 		return nil, fmt.Errorf("decoding wrapped stack key: %w", err)
 	}
 	if ps.EncryptedKey == "" {
+		if ps.Config.HasSecureValue() {
+			return nil, errors.New("cannot initialize a wrapped stack key while encrypted configuration exists")
+		}
 		_, stackKey, err = newWrappedDataKey(ctx, keeper)
 		if err != nil {
 			return nil, fmt.Errorf("wrapping stack key: %w", err)

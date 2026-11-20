@@ -548,7 +548,8 @@ func CopyEntireConfigMap(
 	destinationStack backend.Stack,
 	destinationProjectStack *workspace.ProjectStack,
 ) (bool, error) {
-	var decrypter config.Decrypter
+	var decrypter config.Decrypter = config.NewPanicCrypter()
+	var encrypter config.Encrypter = config.NewPanicCrypter()
 	currentConfig := currentProjectStack.Config
 	currentEnvironments := currentProjectStack.Environment
 
@@ -562,13 +563,12 @@ func CopyEntireConfigMap(
 			"We're reading a secure value so the encryption information must be present already",
 		)
 		decrypter = dec
-	} else {
-		decrypter = config.NewPanicCrypter()
-	}
 
-	encrypter, _, cerr := ssml.GetEncrypter(ctx, destinationStack, destinationProjectStack)
-	if cerr != nil {
-		return false, cerr
+		enc, _, err := ssml.GetEncrypter(ctx, destinationStack, destinationProjectStack)
+		if err != nil {
+			return false, err
+		}
+		encrypter = enc
 	}
 
 	newProjectConfig, err := currentConfig.Copy(
