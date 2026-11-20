@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -73,6 +74,8 @@ func TestDecryptGzipLog(t *testing.T) {
 	assert.Equal(t, content, stdout)
 }
 
+var registerLogConfigKeeper sync.Once
+
 func TestDecryptAndShareLogWithConfigKey(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()
@@ -81,7 +84,9 @@ func TestDecryptAndShareLogWithConfigKey(t *testing.T) {
 
 	const scheme = "log-test-kms"
 	const provider = scheme + "://config-key"
-	gosecrets.DefaultURLMux().RegisterKeeper(scheme, logConfigKeeperOpener{})
+	registerLogConfigKeeper.Do(func() {
+		gosecrets.DefaultURLMux().RegisterKeeper(scheme, logConfigKeeperOpener{})
+	})
 	project := &workspace.Project{
 		Name:    "log-test",
 		Runtime: workspace.NewProjectRuntimeInfo("go", nil),
@@ -93,14 +98,18 @@ func TestDecryptAndShareLogWithConfigKey(t *testing.T) {
 		SecretsProvider: provider,
 		EncryptedKey:    base64.StdEncoding.EncodeToString(key),
 	}
+	const alternateConfig = "alternate.yaml"
 	require.NoError(t, stackConfig.Save("Pulumi.dev.yaml"))
+	require.NoError(t, stackConfig.Save(alternateConfig))
 	configBefore, err := os.ReadFile("Pulumi.dev.yaml")
 	require.NoError(t, err)
 
 	ref := &backend.MockStackReference{NameV: tokens.MustParseStackName("dev")}
 	var checkpoint *apitype.UntypedDeployment
+	checkpointReads := 0
 	b := &backend.MockBackend{
 		ExportDeploymentF: func(context.Context, backend.Stack) (*apitype.UntypedDeployment, error) {
+			checkpointReads++
 			return checkpoint, nil
 		},
 	}
@@ -144,32 +153,47 @@ func TestDecryptAndShareLogWithConfigKey(t *testing.T) {
 		SecretsProviders: &apitype.SecretsProvidersV1{Type: cloud.Type, State: staleKey},
 	})
 	require.NoError(t, err)
-	//nolint:paralleltest // the log commands share a working directory and mock backend
+	//nolint:paralleltest // the log commands share a mock login manager
 	for _, tc := range []struct {
-		name  string
-		state *apitype.UntypedDeployment
+		name       string
+		state      *apitype.UntypedDeployment
+		configFile string
 	}{
 		{name: "no checkpoint"},
 		{name: "stale checkpoint", state: &apitype.UntypedDeployment{Version: 3, Deployment: stale}},
+		{name: "custom file without a project or checkpoint", configFile: alternateConfig},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			checkpoint = tc.state
+			beforeReads := checkpointReads
+			args := []string{name}
+			var commandWorkspace pkgWorkspace.Context = ws
+			if tc.configFile != "" {
+				args = append(args, "--config-file", tc.configFile)
+				commandWorkspace = &pkgWorkspace.MockContext{}
+			}
+
 			var out bytes.Buffer
-			cmd := newDecryptCmd(ws)
+			cmd := newDecryptCmd(commandWorkspace)
 			cmd.SetOut(&out)
-			cmd.SetArgs([]string{name})
+			cmd.SetArgs(args)
 			require.NoError(t, cmd.ExecuteContext(t.Context()))
 			assert.Equal(t, record, out.String())
 
-			file, err := os.Open(name)
-			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, file.Close()) })
-			outPath := filepath.Join(t.TempDir(), "shared.log")
-			require.NoError(t, sharePLOG(t.Context(), ws, "dev", file, outPath, "session", key, true))
-			shared, err := os.ReadFile(outPath)
+			stackName := "dev"
+			share := newShareCmd(commandWorkspace, &stackName,
+				func(context.Context, pkgWorkspace.Context) (string, []byte, error) {
+					return "session", key, nil
+				})
+			share.SetArgs(args)
+			require.NoError(t, share.ExecuteContext(t.Context()))
+			shared, err := os.ReadFile(strings.TrimSuffix(name, ".log") + ".shared.log")
 			require.NoError(t, err)
 			assert.True(t, bytes.HasPrefix(shared, []byte(encryptedlog.Magic)))
 			assert.NotContains(t, string(shared), record)
+			if tc.configFile != "" {
+				assert.Equal(t, beforeReads, checkpointReads)
+			}
 		})
 	}
 	saved, err := os.ReadFile("Pulumi.dev.yaml")

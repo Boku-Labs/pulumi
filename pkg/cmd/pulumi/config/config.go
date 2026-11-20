@@ -1534,10 +1534,11 @@ func getConfig(
 		} else {
 			d = config.NewPanicCrypter()
 		}
-		raw, err := v.Value(secrets.DecrypterWithContext{Context: ctx, Decrypter: d})
+		values, err := (config.Map{key: v}).Decrypt(secrets.DecrypterWithContext{Context: ctx, Decrypter: d})
 		if err != nil {
 			return fmt.Errorf("could not decrypt configuration value: %w", err)
 		}
+		raw := values[key]
 
 		if jsonOut {
 			value := configValueJSON{

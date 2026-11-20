@@ -48,7 +48,7 @@ func (r *containerRef) setPlaintext(pt Plaintext) {
 	}
 }
 
-func collectCiphertextSecrets(objMap map[Key]object, refs *[]containerRef, ctChunks *[][]string) {
+func collectCiphertextSecrets(objMap map[Key]object, refs *[]containerRef, ctChunks *valueChunks) {
 	var process func(obj object, ref containerRef)
 	process = func(obj object, ref containerRef) {
 		switch v := obj.value.(type) {
@@ -68,7 +68,7 @@ func collectCiphertextSecrets(objMap map[Key]object, refs *[]containerRef, ctChu
 			}
 		case CiphertextSecret:
 			*refs = append(*refs, ref)
-			addStringToChunks(ctChunks, v.value, defaultMaxChunkSize)
+			ctChunks.add(v.value, defaultMaxChunkSize)
 		default:
 			contract.Failf("unexpected value of type %T", v)
 		}
@@ -78,7 +78,7 @@ func collectCiphertextSecrets(objMap map[Key]object, refs *[]containerRef, ctChu
 	}
 }
 
-func collectPlaintextSecrets(ptMap map[Key]Plaintext, refs *[]containerRef, ptChunks *[][]string) {
+func collectPlaintextSecrets(ptMap map[Key]Plaintext, refs *[]containerRef, ptChunks *valueChunks) {
 	var process func(pt Plaintext, ref containerRef)
 	process = func(pt Plaintext, ref containerRef) {
 		switch v := pt.value.(type) {
@@ -98,7 +98,7 @@ func collectPlaintextSecrets(ptMap map[Key]Plaintext, refs *[]containerRef, ptCh
 			}
 		case PlaintextSecret:
 			*refs = append(*refs, ref)
-			addStringToChunks(ptChunks, string(v), defaultMaxChunkSize)
+			ptChunks.add(string(v), defaultMaxChunkSize)
 		default:
 			contract.Failf("unexpected value of type %T", v)
 		}
@@ -108,21 +108,18 @@ func collectPlaintextSecrets(ptMap map[Key]Plaintext, refs *[]containerRef, ptCh
 	}
 }
 
-// addStringToChunks adds a value to the last values chunk or creates a new chunk if needed.
-func addStringToChunks(valuesChunks *[][]string, value string, maxChunkSize int) {
-	valueLength := len(value)
-	if len(*valuesChunks) == 0 {
-		*valuesChunks = append(*valuesChunks, []string{value})
+type valueChunks struct {
+	chunks [][]string
+	size   int
+}
+
+func (c *valueChunks) add(value string, limit int) {
+	if len(c.chunks) == 0 || len(value) > limit-c.size {
+		c.chunks = append(c.chunks, []string{value})
+		c.size = len(value)
 		return
 	}
-	lastChunk := &(*valuesChunks)[len(*valuesChunks)-1]
-	currentSize := 0
-	for _, lastChunkValue := range *lastChunk {
-		currentSize += len(lastChunkValue)
-	}
-	if currentSize+valueLength <= maxChunkSize {
-		*lastChunk = append(*lastChunk, value)
-	} else {
-		*valuesChunks = append(*valuesChunks, []string{value})
-	}
+	last := len(c.chunks) - 1
+	c.chunks[last] = append(c.chunks[last], value)
+	c.size += len(value)
 }

@@ -396,3 +396,52 @@ func TestChangeSecretsProvider_ManagedEnvironment(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, stackFile, string(written))
 }
+
+//nolint:paralleltest // changes the working directory
+func TestChangeSecretsProviderBatchesCheckpointEncryption(t *testing.T) {
+	t.Chdir(t.TempDir())
+	require.NoError(t, os.WriteFile("Pulumi.yaml", []byte("name: testProject\nruntime: mock\n"), 0o600))
+
+	old := b64.NewBase64SecretsManager()
+	snapshot := &deploy.Snapshot{
+		SecretsManager: old,
+		Resources: []*pkgresource.State{{
+			URN:  resource.NewURN("testStack", "testProject", "", resource.RootStackType, "testStack"),
+			Type: resource.RootStackType,
+			Outputs: resource.PropertyMap{
+				"first":  resource.MakeSecret(resource.NewProperty("first secret")),
+				"second": resource.MakeSecret(resource.NewProperty("second secret")),
+			},
+		}},
+	}
+	b := &backend.MockBackend{
+		ExportDeploymentF: func(ctx context.Context, _ backend.Stack) (*apitype.UntypedDeployment, error) {
+			return stack.SerializeUntypedDeployment(ctx, snapshot, nil)
+		},
+		ImportDeploymentF: func(context.Context, backend.Stack, *apitype.UntypedDeployment) error { return nil },
+	}
+	current := &backend.MockStack{
+		BackendF: func() backend.Backend { return b },
+		RefF: func() backend.StackReference {
+			return &backend.MockStackReference{NameV: tokens.MustParseStackName("testStack")}
+		},
+		ConfigLocationF: func() backend.StackConfigLocation { return backend.StackConfigLocation{} },
+	}
+
+	batches := 0
+	newManager := &secrets.MockSecretsManager{
+		TypeF:  old.Type,
+		StateF: old.State,
+		EncrypterF: func() config.Encrypter {
+			return &secrets.MockEncrypter{BatchEncryptF: func(values []string) []string {
+				batches++
+				assert.ElementsMatch(t, []string{`"first secret"`, `"second secret"`}, values)
+				return []string{"ciphertext1", "ciphertext2"}
+			}}
+		},
+	}
+	require.NoError(t, migrateOldConfigAndCheckpointToNewSecretsProvider(
+		t.Context(), b64.Base64SecretsProvider, current, &workspace.ProjectStack{}, old.Decrypter(), newManager,
+	))
+	require.Equal(t, 1, batches)
+}

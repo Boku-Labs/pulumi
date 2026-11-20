@@ -45,6 +45,7 @@ func newShareCmd(
 ) *cobra.Command {
 	var includeSecrets bool
 	var latest bool
+	var configFile string
 
 	cmd := &cobra.Command{
 		Use:   "share",
@@ -110,7 +111,7 @@ func newShareCmd(
 			}
 
 			if string(magic[:]) == encryptedlog.Magic {
-				err = sharePLOG(ctx, ws, stackName, f, outPath, sessionID, sessionKey, redact)
+				err = sharePLOG(ctx, ws, stackName, configFile, f, outPath, sessionID, sessionKey, redact)
 			} else {
 				err = shareGzip(f, outPath, sessionID, sessionKey, redact)
 			}
@@ -130,6 +131,8 @@ func newShareCmd(
 		Required:  0,
 	})
 
+	cmd.Flags().StringVar(&configFile, "config-file", "",
+		"Use the cloud secrets key from this stack configuration file")
 	cmd.Flags().BoolVar(&latest, "latest", false,
 		"Share the most recent log file without prompting")
 	cmd.Flags().BoolVar(&includeSecrets, "include-secrets", false,
@@ -141,10 +144,10 @@ func newShareCmd(
 // sharePLOG decrypts a PLOG file, optionally redacts secrets, and
 // re-encrypts the content with the service-provided session key.
 func sharePLOG(
-	ctx context.Context, ws pkgWorkspace.Context, stackName string,
+	ctx context.Context, ws pkgWorkspace.Context, stackName, configFile string,
 	f *os.File, outPath string, sessionID string, sessionKey []byte, redact bool,
 ) error {
-	reader, err := openStackLog(ctx, ws, stackName, f)
+	reader, err := openStackLog(ctx, ws, stackName, configFile, f)
 	if err != nil {
 		return err
 	}

@@ -437,7 +437,7 @@ func copySingleConfigKey(
 		}
 	}
 
-	val, err := v.Copy(
+	values, err := (config.Map{key: v}).Copy(
 		secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter},
 		secrets.EncrypterWithContext{Context: ctx, Encrypter: encrypter},
 	)
@@ -445,7 +445,7 @@ func copySingleConfigKey(
 		return err
 	}
 
-	err = destinationProjectStack.Config.Set(key, val, path)
+	err = destinationProjectStack.Config.Set(key, values[key], path)
 	if err != nil {
 		return err
 	}

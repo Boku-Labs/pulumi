@@ -53,6 +53,7 @@ import (
 
 func newDecryptCmd(ws pkgWorkspace.Context) *cobra.Command {
 	var latest bool
+	var configFile string
 	command := &cobra.Command{
 		Use:   "decrypt [filename]",
 		Short: "Decrypt and display automatic logs",
@@ -107,7 +108,11 @@ func newDecryptCmd(ws pkgWorkspace.Context) *cobra.Command {
 			defer out.Flush()
 
 			if string(magic[:]) == encryptedlog.Magic {
-				return decryptPLOG(cmd, ws, stackName, f, out)
+				reader, err := openStackLog(cmd.Context(), ws, stackName, configFile, f)
+				if err != nil {
+					return err
+				}
+				return formatLogRecords(reader, out, false)
 			}
 
 			gz, err := gzip.NewReader(f)
@@ -120,27 +125,34 @@ func newDecryptCmd(ws pkgWorkspace.Context) *cobra.Command {
 		},
 	}
 
+	command.Flags().StringVar(&configFile, "config-file", "",
+		"Use the cloud secrets key from this stack configuration file")
 	command.Flags().BoolVar(&latest, "latest", false,
 		"Decrypt the most recent log file without prompting")
 
 	return command
 }
 
-func decryptPLOG(
-	cmd *cobra.Command, ws pkgWorkspace.Context,
-	stackName string, f *os.File, out io.Writer,
-) error {
-	reader, err := openStackLog(cmd.Context(), ws, stackName, f)
-	if err != nil {
-		return err
-	}
-	return formatLogRecords(reader, out, false)
-}
-
-// openStackLog opens logs with the deployed key or the key in stack YAML.
+// openStackLog uses an explicit config file when supplied, otherwise it tries the checkpoint and stack YAML.
 func openStackLog(
-	ctx context.Context, ws pkgWorkspace.Context, stackName string, f *os.File,
+	ctx context.Context, ws pkgWorkspace.Context, stackName, configFile string, f *os.File,
 ) (*encryptedlog.Reader, error) {
+	if configFile != "" {
+		project, _, err := ws.ReadProject("")
+		if err != nil && !errors.Is(err, workspace.ErrProjectNotFound) {
+			return nil, err
+		}
+		ps, err := workspace.LoadProjectStack(cmdutil.Diag(), project, configFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading stack configuration %q: %w", configFile, err)
+		}
+		reader, err := openLogWithConfigKey(ctx, f, ps)
+		if err != nil {
+			return nil, fmt.Errorf("decrypting log using stack configuration %q: %w", configFile, err)
+		}
+		return reader, nil
+	}
+
 	if stackName == "" {
 		stackName = stackNameFromFilename(filepath.Base(f.Name()))
 	}
@@ -190,6 +202,12 @@ func openLogWithStackConfig(
 	if err != nil {
 		return nil, err
 	}
+	return openLogWithConfigKey(ctx, f, ps)
+}
+
+func openLogWithConfigKey(
+	ctx context.Context, f *os.File, ps *workspace.ProjectStack,
+) (*encryptedlog.Reader, error) {
 	sm, err := cloud.OpenCloudSecretsManager(ctx, ps)
 	if err != nil {
 		return nil, err

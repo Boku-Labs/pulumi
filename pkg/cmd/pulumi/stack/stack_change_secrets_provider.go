@@ -201,7 +201,7 @@ func migrateOldConfigAndCheckpointToNewSecretsProvider(
 	}
 
 	// Reserialize the snapshot with the new secrets manager.
-	snap.SecretsManager = newManager
+	snap.SecretsManager = stack.NewBatchingCachingSecretsManager(newManager)
 	dep, err := stack.SerializeUntypedDeployment(ctx, snap, nil /*opts*/)
 	if err != nil {
 		return err

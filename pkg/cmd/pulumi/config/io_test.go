@@ -15,6 +15,7 @@
 package config
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"path/filepath"
@@ -636,6 +637,82 @@ func TestCopyPlaintextConfigDoesNotLoadKMS(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, source.Config, saved.Config)
 	assert.Empty(t, saved.EncryptedKey)
+}
+
+func TestGetAndCopyConfigBatchNestedSecrets(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	key := config.MustMakeKey("project", "object")
+	project := &workspace.Project{Name: "project"}
+	workspaceContext := &pkgWorkspace.MockContext{
+		ReadProjectF: func(string) (*workspace.Project, string, error) { return project, "", nil },
+	}
+	sourceConfig := &workspace.ProjectStack{Config: config.Map{
+		key: config.NewSecureObjectValue(`{"first":{"secure":"one"},"items":[{"secure":"two"}]}`),
+	}}
+	sourceFile := filepath.Join(t.TempDir(), "source.yaml")
+	require.NoError(t, sourceConfig.Save(sourceFile))
+
+	decryptBatches, encryptBatches := 0, 0
+	sourceManager := &secrets.MockSecretsManager{
+		DecrypterF: func() config.Decrypter {
+			return &secrets.MockDecrypter{BatchDecryptF: func(ciphertexts []string) []string {
+				decryptBatches++
+				assert.ElementsMatch(t, []string{"one", "two"}, ciphertexts)
+				return ciphertexts
+			}}
+		},
+	}
+	destinationManager := &secrets.MockSecretsManager{
+		EncrypterF: func() config.Encrypter {
+			return &secrets.MockEncrypter{BatchEncryptF: func(plaintexts []string) []string {
+				encryptBatches++
+				assert.ElementsMatch(t, []string{"one", "two"}, plaintexts)
+				values := make([]string, len(plaintexts))
+				for i, value := range plaintexts {
+					values[i] = "wrapped:" + value
+				}
+				return values
+			}}
+		},
+	}
+	mockStack := func(name string, manager secrets.Manager) *backend.MockStack {
+		return &backend.MockStack{
+			RefF: func() backend.StackReference {
+				return &backend.MockStackReference{
+					NameV:               tokens.MustParseStackName(name),
+					FullyQualifiedNameV: tokens.QName("org/project/" + name),
+				}
+			},
+			ConfigLocationF: func() backend.StackConfigLocation { return backend.StackConfigLocation{} },
+			DefaultSecretManagerF: func(context.Context, *workspace.ProjectStack) (secrets.Manager, error) {
+				return manager, nil
+			},
+		}
+	}
+	sourceStack := mockStack("source", sourceManager)
+	destinationStack := mockStack("destination", destinationManager)
+
+	var out bytes.Buffer
+	require.NoError(t, getConfig(ctx, &out, cmdutil.Diag(), stack.SecretsManagerLoader{}, workspaceContext,
+		sourceStack, key, false, false, false, sourceFile))
+	assert.JSONEq(t, `{"first":"one","items":["two"]}`, out.String())
+	require.Equal(t, 1, decryptBatches)
+
+	destination := &workspace.ProjectStack{Config: make(config.Map)}
+	destinationFile := filepath.Join(t.TempDir(), "destination.yaml")
+	require.NoError(t, copySingleConfigKey(ctx, stack.SecretsManagerLoader{}, key.String(), false,
+		sourceStack, sourceConfig, destinationStack, destination, destinationFile))
+	require.Equal(t, 2, decryptBatches)
+	require.Equal(t, 1, encryptBatches)
+
+	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), project, destinationFile)
+	require.NoError(t, err)
+	assert.True(t, saved.Config[key].Secure())
+	ciphertexts, err := saved.Config[key].SecureValues(config.NopDecrypter)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"wrapped:one", "wrapped:two"}, ciphertexts)
 }
 
 func TestOpenStackEnvDiags(t *testing.T) {
