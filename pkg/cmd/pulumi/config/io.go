@@ -438,7 +438,10 @@ func copySingleConfigKey(
 		return cerr
 	}
 
-	val, err := v.Copy(decrypter, encrypter)
+	val, err := v.Copy(
+		secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter},
+		secrets.EncrypterWithContext{Context: ctx, Encrypter: encrypter},
+	)
 	if err != nil {
 		return err
 	}

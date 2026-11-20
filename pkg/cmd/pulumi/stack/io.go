@@ -37,6 +37,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/ui"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
+	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
@@ -570,7 +571,10 @@ func CopyEntireConfigMap(
 		return false, cerr
 	}
 
-	newProjectConfig, err := currentConfig.Copy(decrypter, encrypter)
+	newProjectConfig, err := currentConfig.Copy(
+		secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter},
+		secrets.EncrypterWithContext{Context: ctx, Encrypter: encrypter},
+	)
 	if err != nil {
 		return false, err
 	}

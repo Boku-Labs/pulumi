@@ -17,6 +17,7 @@ package secrets
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
@@ -52,4 +53,34 @@ func AreCompatible(a, b Manager) bool {
 	as := a.State()
 	bs := b.State()
 	return bytes.Equal(as, bs)
+}
+
+// EncrypterWithContext carries a command's context through config APIs that
+// do not accept one.
+type EncrypterWithContext struct {
+	Context context.Context
+	config.Encrypter
+}
+
+func (e EncrypterWithContext) EncryptValue(_ context.Context, value string) (string, error) {
+	return e.Encrypter.EncryptValue(e.Context, value)
+}
+
+func (e EncrypterWithContext) BatchEncrypt(_ context.Context, values []string) ([]string, error) {
+	return e.Encrypter.BatchEncrypt(e.Context, values)
+}
+
+// DecrypterWithContext carries a command's context through config APIs that
+// do not accept one.
+type DecrypterWithContext struct {
+	Context context.Context
+	config.Decrypter
+}
+
+func (d DecrypterWithContext) DecryptValue(_ context.Context, value string) (string, error) {
+	return d.Decrypter.DecryptValue(d.Context, value)
+}
+
+func (d DecrypterWithContext) BatchDecrypt(_ context.Context, values []string) ([]string, error) {
+	return d.Decrypter.BatchDecrypt(d.Context, values)
 }

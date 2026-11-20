@@ -26,7 +26,6 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
@@ -158,70 +157,36 @@ func (cmd *stackChangeSecretsProviderCmd) Run(ctx context.Context, args []string
 		// passphrase doesn't get saved to stack state, so if we're changing to passphrase see if
 		// the current secrets provider is empty
 		((secretsProvider == "passphrase") && (currentProjectStack.SecretsProvider == ""))
-	// Create the new secrets provider and set to the currentStack
-	if err := CreateSecretsManagerForExistingStack(ctx, cmdutil.Diag(), ws, currentStack, secretsProvider, rotateProvider,
-		false /*creatingStack*/); err != nil {
+	newConfig := *currentProjectStack
+	newManager, err := configureSecretsManager(ctx, currentStack, &newConfig, secretsProvider, rotateProvider)
+	if err != nil {
 		return err
 	}
 
-	// Fixup the checkpoint
 	fmt.Fprintf(stdout, "Migrating old configuration and state to new secrets provider\n")
 	return migrateOldConfigAndCheckpointToNewSecretsProvider(
-		ctx,
-		cmdutil.Diag(),
-		ssml,
-		cmd.secretsProvider,
-		project,
-		currentStack,
-		currentProjectStack,
-		decrypter,
+		ctx, cmd.secretsProvider, currentStack, &newConfig, decrypter, newManager,
 	)
 }
 
 func migrateOldConfigAndCheckpointToNewSecretsProvider(
 	ctx context.Context,
-	sink diag.Sink,
-	ssml SecretsManagerLoader,
 	secretsProvider secrets.Provider,
-	project *workspace.Project,
 	currentStack backend.Stack,
-	currentConfig *workspace.ProjectStack,
+	newConfig *workspace.ProjectStack,
 	decrypter config.Decrypter,
+	newManager secrets.Manager,
 ) error {
-	// Reload the project stack after the new secrets provider is in place
-	reloadedProjectStack, err := LoadProjectStack(ctx, sink, project, currentStack, "")
-	if err != nil {
-		return err
-	}
-
-	// Get the newly created secrets manager for the stack
-	newSecretsManager, state, err := ssml.GetSecretsManager(ctx, currentStack, reloadedProjectStack)
-	if err != nil {
-		return err
-	}
-	contract.Assertf(
-		state == SecretsManagerUnchanged,
-		"We've just saved and reloaded the stack, so the encryption information must be present already",
+	// Prepare config and checkpoint before saving either. Until the old config has
+	// been decrypted, it must stay paired with its original provider metadata.
+	newProjectConfig, err := newConfig.Config.Copy(
+		secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter},
+		secrets.EncrypterWithContext{Context: ctx, Encrypter: newManager.Encrypter()},
 	)
-
-	// get the encrypter for the new secrets manager
-	newEncrypter := newSecretsManager.Encrypter()
-
-	// Create a copy of the current config map and re-encrypt using the new secrets provider
-	newProjectConfig, err := currentConfig.Config.Copy(decrypter, newEncrypter)
 	if err != nil {
 		return err
 	}
-
-	for key, val := range newProjectConfig {
-		if err := reloadedProjectStack.Config.Set(key, val, false); err != nil {
-			return err
-		}
-	}
-
-	if err := SaveProjectStack(ctx, currentStack, reloadedProjectStack, ""); err != nil {
-		return err
-	}
+	newConfig.Config = newProjectConfig
 
 	// Load the current checkpoint so those secrets can also be decrypted
 	checkpoint, err := backend.ExportStackDeployment(ctx, currentStack)
@@ -233,13 +198,15 @@ func migrateOldConfigAndCheckpointToNewSecretsProvider(
 		return stack.FormatDeploymentDeserializationError(err, currentStack.Ref().Name().String())
 	}
 
-	// Reserialize the Snapshopshot with the NewSecrets Manager
-	snap.SecretsManager = newSecretsManager
+	// Reserialize the snapshot with the new secrets manager.
+	snap.SecretsManager = newManager
 	dep, err := stack.SerializeUntypedDeployment(ctx, snap, nil /*opts*/)
 	if err != nil {
 		return err
 	}
 
-	// Import the newly changes Deployment
+	if err := SaveProjectStack(ctx, currentStack, newConfig, ""); err != nil {
+		return err
+	}
 	return backend.ImportStackDeployment(ctx, currentStack, dep)
 }

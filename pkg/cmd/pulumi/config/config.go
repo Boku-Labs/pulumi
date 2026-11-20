@@ -751,13 +751,20 @@ type configSetCmd struct {
 	Type      string
 
 	OverrideImport bool
+
+	secretsManagerLoader *cmdStack.SecretsManagerLoader
 }
 
 func newConfigSetCmd(
 	ws pkgWorkspace.Context, stack *string, lm cmdBackend.LoginManager, configFile *string,
 ) *cobra.Command {
-	configSetCmd := &configSetCmd{LoadProjectStack: cmdStack.LoadProjectStack}
+	set := &configSetCmd{LoadProjectStack: cmdStack.LoadProjectStack}
+	return set.command(ws, stack, lm, configFile)
+}
 
+func (configSetCmd *configSetCmd) command(
+	ws pkgWorkspace.Context, stack *string, lm cmdBackend.LoginManager, configFile *string,
+) *cobra.Command {
 	setCmd := &cobra.Command{
 		Use:   "set",
 		Short: "Set configuration value",
@@ -900,8 +907,12 @@ func (c *configSetCmd) Run(
 		return err
 	}
 
-	ssml := cmdStack.NewStackSecretsManagerLoaderFromEnv()
-	w, err := newConfigWriter(s, project.Name, ps, configFile, &ssml, c.OverrideImport)
+	ssml := c.secretsManagerLoader
+	if ssml == nil {
+		loader := cmdStack.NewStackSecretsManagerLoaderFromEnv()
+		ssml = &loader
+	}
+	w, err := newConfigWriter(s, project.Name, ps, configFile, ssml, c.OverrideImport)
 	if err != nil {
 		return err
 	}
@@ -1319,7 +1330,7 @@ func listConfig(
 	}
 	sort.Sort(keys)
 
-	decryptedCfg, err := cfg.Decrypt(decrypter)
+	decryptedCfg, err := cfg.Decrypt(secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter})
 	if err != nil {
 		return fmt.Errorf("could not decrypt configuration values: %w", err)
 	}
@@ -1514,7 +1525,7 @@ func getConfig(
 		} else {
 			d = config.NewPanicCrypter()
 		}
-		raw, err := v.Value(d)
+		raw, err := v.Value(secrets.DecrypterWithContext{Context: ctx, Decrypter: d})
 		if err != nil {
 			return fmt.Errorf("could not decrypt configuration value: %w", err)
 		}

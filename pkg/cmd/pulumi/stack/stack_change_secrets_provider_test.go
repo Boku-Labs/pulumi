@@ -200,6 +200,11 @@ func TestChangeSecretsProvider_WithSecrets(t *testing.T) {
 	// Ideally this would be injected but the cmd functions repeatedly access global state to get the current
 	// backend.
 	secretsManager := b64.NewBase64SecretsManager()
+	oldConfigManager := secrets.Manager(&secrets.MockSecretsManager{
+		DecrypterF: func() config.Decrypter {
+			return &secrets.MockDecrypter{}
+		},
+	})
 	snapshot := &deploy.Snapshot{
 		SecretsManager: secretsManager,
 		Resources: []*pkgresource.State{
@@ -249,7 +254,7 @@ func TestChangeSecretsProvider_WithSecrets(t *testing.T) {
 			return snapshot, nil
 		},
 		DefaultSecretManagerF: func(_ context.Context, _ *workspace.ProjectStack) (secrets.Manager, error) {
-			return secretsManager, nil
+			return oldConfigManager, nil
 		},
 	}
 
@@ -290,7 +295,20 @@ runtime: mock
 	err = cfg.Save("Pulumi.testStack.yaml")
 	require.NoError(t, err)
 
-	// passphrase will read from stdin for the new passphrase
+	original, err := os.ReadFile("Pulumi.testStack.yaml")
+	require.NoError(t, err)
+
+	// A failure reading an old secret must leave the original config and checkpoint intact.
+	mockStdin(t, "password123\npassword123\n")
+	require.ErrorContains(t, cmd.Run(ctx, []string{"passphrase"}), "mock value not provided")
+	afterFailure, err := os.ReadFile("Pulumi.testStack.yaml")
+	require.NoError(t, err)
+	assert.Equal(t, original, afterFailure)
+	assert.Equal(t, b64.Type, snapshot.SecretsManager.Type())
+
+	// Retry after the old decrypter is available again.
+	oldConfigManager = secretsManager
+	stdoutBuff.Reset()
 	mockStdin(t, "password123\npassword123\n")
 	err = cmd.Run(ctx, []string{"passphrase"})
 	require.NoError(t, err)

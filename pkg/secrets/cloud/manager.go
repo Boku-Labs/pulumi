@@ -120,7 +120,7 @@ func newCloudSecretsManagerWithKeeper(url string, encryptedDataKey []byte, keepe
 	}
 	crypter := config.NewSymmetricCrypter(plaintextDataKey)
 	var decrypter config.Decrypter = crypter
-	if strings.HasPrefix(url, gcpKMSScheme) {
+	if parseGCPKMSProvider(url) != nil {
 		decrypter = gcpConfigDecrypter{legacy: crypter, keeper: keeper, stackKey: encryptedDataKey}
 	}
 	cachedCrypter := config.NewCiphertextToPlaintextCachedCrypter(crypter, decrypter)
