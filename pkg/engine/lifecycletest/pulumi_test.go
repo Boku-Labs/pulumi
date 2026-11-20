@@ -583,6 +583,55 @@ func TestBrokenDecrypter(t *testing.T) {
 	p.Run(t, nil)
 }
 
+type configBatchDecrypter struct {
+	config.Decrypter
+	batch func(context.Context, []string) ([]string, error)
+}
+
+func (d configBatchDecrypter) BatchDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
+	return d.batch(ctx, ciphertexts)
+}
+
+func TestConfigSecretRedactionBatchesAndCancels(t *testing.T) {
+	t.Parallel()
+
+	for _, dryRun := range []bool{true, false} {
+		t.Run(fmt.Sprintf("preview=%t", dryRun), func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			var batches [][]string
+			p := &lt.TestPlan{
+				Options: lt.TestUpdateOptions{T: t, SkipDisplayTests: true},
+				Config: config.Map{
+					config.MustMakeKey("test", "first"):  config.NewSecureValue("encrypted first"),
+					config.MustMakeKey("test", "second"): config.NewSecureValue("encrypted second"),
+				},
+				Decrypter: configBatchDecrypter{
+					Decrypter: config.NewPanicCrypter(),
+					batch: func(ctx context.Context, ciphertexts []string) ([]string, error) {
+						batches = append(batches, ciphertexts)
+						cancel()
+						select {
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						case <-time.After(5 * time.Second):
+							return nil, errors.New("decryption did not receive cancellation")
+						}
+					},
+				},
+			}
+			_, err := lt.TestOp(Update).RunWithContext(
+				ctx, p.GetProject(), p.GetTarget(t, nil), p.Options, dryRun, nil, nil,
+			)
+			require.ErrorIs(t, err, context.Canceled)
+			require.Len(t, batches, 1)
+			assert.ElementsMatch(t, []string{"encrypted first", "encrypted second"}, batches[0])
+		})
+	}
+}
+
 func TestBadResourceType(t *testing.T) {
 	t.Parallel()
 

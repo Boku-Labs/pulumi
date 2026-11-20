@@ -163,6 +163,8 @@ func (cmd *stackChangeSecretsProviderCmd) Run(ctx context.Context, args []string
 		return err
 	}
 
+	upgradeStackLogger(ctx, currentStack, newManager)
+
 	fmt.Fprintf(stdout, "Migrating old configuration and state to new secrets provider\n")
 	return migrateOldConfigAndCheckpointToNewSecretsProvider(
 		ctx, cmd.secretsProvider, currentStack, &newConfig, decrypter, newManager,

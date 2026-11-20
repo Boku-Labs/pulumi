@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"testing"
 
@@ -25,6 +26,8 @@ import (
 
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	cmdBackend "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/backend"
+	"github.com/pulumi/pulumi/pkg/v3/engine/encryptedlog"
+	pkgLogging "github.com/pulumi/pulumi/pkg/v3/logging"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
@@ -154,9 +157,20 @@ func TestChangeSecretsProvider_NoSecrets(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	t.Chdir(tmpDir)
+	t.Setenv("PULUMI_HOME", tmpDir)
+	log, err := pkgLogging.StartLogging(t.Context(), nil, "stack change-secrets-provider")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if log != nil {
+			require.NoError(t, log.Close())
+		}
+	})
+	const diagnostic = "rotation diagnostic"
+	_, err = log.Write([]byte(diagnostic))
+	require.NoError(t, err)
 
 	// Setup a dummy project in this directory
-	err := os.WriteFile("Pulumi.yaml", []byte(`
+	err = os.WriteFile("Pulumi.yaml", []byte(`
 name: testProject
 runtime: mock
 `), 0o600)
@@ -170,6 +184,20 @@ runtime: mock
 
 	// Check that the snapshot now has a passphrase secrets manager
 	assert.Equal(t, "passphrase", snapshot.SecretsManager.Type())
+
+	logPath := log.FilePath()
+	closeErr := log.Close()
+	log = nil
+	require.NoError(t, closeErr)
+	logFile, err := os.Open(logPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, logFile.Close()) })
+	reader, err := encryptedlog.NewReader(t.Context(), logFile, snapshot.SecretsManager.Decrypter())
+	require.NoError(t, err)
+	records, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	assert.Contains(t, string(records), diagnostic)
+
 	// Check the config has been updated with the salt
 	project, err := workspace.LoadProject("Pulumi.yaml")
 	require.NoError(t, err)

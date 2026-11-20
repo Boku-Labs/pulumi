@@ -16,6 +16,8 @@ package engine
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"time"
 
 	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
@@ -450,27 +452,14 @@ type StepEventStateMetadata struct {
 	HideDiffs []resource.PropertyPath
 }
 
-func makeEventEmitter(events chan<- Event, update UpdateInfo) (eventEmitter, error) {
-	target := update.Target
-	var secrets []string
-	if target != nil && target.Config.HasSecureValue() {
-		for k, v := range target.Config {
-			if !v.Secure() {
-				continue
-			}
-
-			secureValues, err := v.SecureValues(target.Decrypter)
-			if err != nil {
-				return eventEmitter{}, DecryptError{
-					Key: k,
-					Err: err,
-				}
-			}
-			secrets = append(secrets, secureValues...)
+func makeEventEmitter(ctx context.Context, events chan<- Event, update UpdateInfo) (eventEmitter, error) {
+	if target := update.Target; target != nil && target.Config.HasSecureValue() {
+		secrets, err := configSecretsForRedaction(ctx, target.Config, target.Decrypter)
+		if err != nil {
+			return eventEmitter{}, err
 		}
+		logging.AddGlobalSecretFilter(secrets, "[secret]")
 	}
-
-	logging.AddGlobalSecretFilter(secrets, "[secret]")
 
 	buffer, done := make(chan Event), make(chan bool)
 	go queueEvents(events, buffer, done)
@@ -479,6 +468,45 @@ func makeEventEmitter(events chan<- Event, update UpdateInfo) (eventEmitter, err
 		done: done,
 		ch:   buffer,
 	}, nil
+}
+
+func configSecretsForRedaction(ctx context.Context, cfg config.Map, decrypter config.Decrypter) ([]string, error) {
+	secureConfig := make(config.Map)
+	for key, value := range cfg {
+		if value.Secure() {
+			secureConfig[key] = value
+		}
+	}
+	decrypted, err := secureConfig.AsDecryptedPropertyMap(ctx, decrypter)
+	if err != nil {
+		if len(secureConfig) == 1 {
+			for key := range secureConfig {
+				return nil, DecryptError{Key: key, Err: err}
+			}
+		}
+		return nil, fmt.Errorf("failed to decrypt configuration secrets: %w", err)
+	}
+	var secrets []string
+	for _, value := range decrypted.All {
+		secrets = appendConfigSecrets(secrets, value)
+	}
+	return secrets, nil
+}
+
+func appendConfigSecrets(secrets []string, value property.Value) []string {
+	switch {
+	case value.IsString() && value.Secret():
+		secrets = append(secrets, value.AsString())
+	case value.IsArray():
+		for _, element := range value.AsArray().All {
+			secrets = appendConfigSecrets(secrets, element)
+		}
+	case value.IsMap():
+		for _, element := range value.AsMap().All {
+			secrets = appendConfigSecrets(secrets, element)
+		}
+	}
+	return secrets
 }
 
 func makeQueryEventEmitter(events chan<- Event) (eventEmitter, error) {

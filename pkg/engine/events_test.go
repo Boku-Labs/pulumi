@@ -19,7 +19,9 @@ import (
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTrySendEvent(t *testing.T) {
@@ -64,4 +66,16 @@ func TestUpdateStartedEventIsInternal(t *testing.T) {
 
 	assert.Equal(t, UpdateStartedEvent, e.Type)
 	assert.True(t, e.Internal())
+}
+
+func TestConfigSecretsForRedaction(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Map{
+		config.MustMakeKey("test", "first"):  config.NewSecureValue("top-level secret"),
+		config.MustMakeKey("test", "nested"): config.NewSecureObjectValue(`{"array":[{"secure":"nested secret"},"plain"]}`),
+	}
+	secrets, err := configSecretsForRedaction(t.Context(), cfg, config.NopDecrypter)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"top-level secret", "nested secret"}, secrets)
 }

@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,22 +70,16 @@ func parseGCPKMSProvider(rawURL string) *url.URL {
 func NewConfigEncrypter(
 	ctx context.Context, ps *workspace.ProjectStack, open func(context.Context, string) (ConfigKMSKeeper, error),
 ) (config.Encrypter, error) {
-	provider := parseGCPKMSProvider(ps.SecretsProvider)
-	if provider == nil {
+	provider := ps.SecretsProvider
+	if parseGCPKMSProvider(provider) == nil || effectiveCloudSecretsProvider(provider) != provider {
 		return nil, nil
-	}
-	if override := os.Getenv("PULUMI_CLOUD_SECRET_OVERRIDE"); override != "" {
-		overrideProvider := parseGCPKMSProvider(override)
-		if overrideProvider == nil || overrideProvider.String() != provider.String() {
-			return nil, nil
-		}
 	}
 	var keeper ConfigKMSKeeper
 	var err error
 	if open == nil {
-		keeper, err = openKeeper(ctx, ps.SecretsProvider)
+		keeper, err = openKeeper(ctx, provider)
 	} else {
-		keeper, err = open(ctx, ps.SecretsProvider)
+		keeper, err = open(ctx, provider)
 	}
 	if err != nil {
 		return nil, err

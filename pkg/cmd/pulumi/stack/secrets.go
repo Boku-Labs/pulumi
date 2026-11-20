@@ -221,7 +221,7 @@ func (l *SecretsManagerLoader) GetEncrypter(
 	if enc != nil {
 		fqn := string(s.Ref().FullyQualifiedName())
 		if err := pkgLogging.UpgradeCurrentLoggerWithEncrypter(ctx, fqn, "", enc); err != nil {
-			slog.InfoContext(ctx, "encrypted log upgrade failed", "err", err)
+			return nil, SecretsManagerUnchanged, fmt.Errorf("encrypting command diagnostics: %w", err)
 		}
 		if needsSaveProjectStackAfterSecretManger(&oldConfig, ps) {
 			return enc, SecretsManagerMustSave, nil
@@ -327,12 +327,15 @@ func (l *SecretsManagerLoader) GetSecretsManager(
 
 	bsm := stack.NewBatchingCachingSecretsManager(sm)
 
+	upgradeStackLogger(ctx, s, bsm)
+	return bsm, state, nil
+}
+
+func upgradeStackLogger(ctx context.Context, s backend.Stack, sm secrets.Manager) {
 	fqn := string(s.Ref().FullyQualifiedName())
-	if err := pkgLogging.UpgradeCurrentLogger(ctx, fqn, "", bsm); err != nil {
+	if err := pkgLogging.UpgradeCurrentLogger(ctx, fqn, "", sm); err != nil {
 		slog.InfoContext(ctx, "encrypted log upgrade failed", "err", err)
 	}
-
-	return bsm, state, nil
 }
 
 func needsSaveProjectStackAfterSecretManger(

@@ -612,7 +612,8 @@ func TestConfigSetSecretWithEncryptOnlyKMS(t *testing.T) {
 		ReadProjectF: func(string) (*workspace.Project, string, error) { return project, dir, nil },
 	}
 
-	keeper := &encryptOnlyConfigKeeper{}
+	encryptErr := errors.New("temporary KMS failure")
+	keeper := &encryptOnlyConfigKeeper{nextEncryptErr: encryptErr}
 	set := &configSetCmd{
 		LoadProjectStack: cmdStack.LoadProjectStack,
 		secretsManagerLoader: &cmdStack.SecretsManagerLoader{
@@ -625,6 +626,14 @@ func TestConfigSetSecretWithEncryptOnlyKMS(t *testing.T) {
 	stackName := ref.Name().String()
 	cmd := set.command(ws, &stackName, lm, &path)
 	cmd.SetArgs([]string{"--secret", "testProject:test", plaintext})
+	originalConfig, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.ErrorIs(t, cmd.ExecuteContext(t.Context()), encryptErr)
+	currentConfig, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, originalConfig, currentConfig)
+	assert.Equal(t, 1, keeper.encrypts)
+
 	require.NoError(t, cmd.ExecuteContext(t.Context()))
 
 	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), project, path)
@@ -641,17 +650,22 @@ func TestConfigSetSecretWithEncryptOnlyKMS(t *testing.T) {
 	logData, err := os.ReadFile(log.FilePath())
 	require.NoError(t, err)
 	assert.True(t, bytes.HasPrefix(logData, []byte(encryptedlog.Magic)))
-	assert.Equal(t, 2, keeper.encrypts, "the log key and the config value each use Encrypt")
+	assert.Equal(t, 3, keeper.encrypts, "the retry encrypts the log key and the config value")
 	assert.Zero(t, keeper.decrypts)
 }
 
 type encryptOnlyConfigKeeper struct {
-	encrypts int
-	decrypts int
+	nextEncryptErr error
+	encrypts       int
+	decrypts       int
 }
 
 func (k *encryptOnlyConfigKeeper) Encrypt(_ context.Context, key []byte) ([]byte, error) {
 	k.encrypts++
+	if err := k.nextEncryptErr; err != nil {
+		k.nextEncryptErr = nil
+		return nil, err
+	}
 	return append([]byte("wrapped:"), key...), nil
 }
 

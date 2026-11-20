@@ -73,18 +73,6 @@ func openKeeper(ctx context.Context, url string) (*gosecrets.Keeper, error) {
 	}
 }
 
-// generateNewDataKey generates a new DataKey seeded by a fresh random 32-byte key and encrypted
-// using the target cloud key management service.
-func generateNewDataKey(url string) ([]byte, error) {
-	ctx := context.Background()
-	keeper, err := openKeeper(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	_, wrapped, err := newWrappedDataKey(ctx, keeper)
-	return wrapped, err
-}
-
 // newCloudSecretsManager returns a secrets manager that uses the target cloud key management
 // service to encrypt/decrypt a data key used for envelope encryption of secrets values.
 func newCloudSecretsManager(url string, encryptedDataKey []byte) (*Manager, error) {
@@ -193,52 +181,62 @@ func NewCloudSecretsManagerFromState(state json.RawMessage) (secrets.Manager, er
 func NewCloudSecretsManager(info *workspace.ProjectStack,
 	secretsProvider string, rotateSecretsProvider bool,
 ) (secrets.Manager, error) {
-	// Only a passphrase provider has an encryption salt. So changing a secrets provider
-	// from passphrase to a cloud secrets provider should ensure that we remove the enryptionsalt
-	// as it's a legacy artifact and needs to be removed
+	return newCloudSecretsManagerForStack(info, secretsProvider, rotateSecretsProvider, openKeeper)
+}
+
+// effectiveCloudSecretsProvider applies a per-execution override. Preserve the
+// configured spelling of an equivalent GCP KMS URL to keep its wrapped key.
+func effectiveCloudSecretsProvider(provider string) string {
+	override := os.Getenv("PULUMI_CLOUD_SECRET_OVERRIDE")
+	if override == "" || override == provider {
+		return provider
+	}
+	configured := parseGCPKMSProvider(provider)
+	replacement := parseGCPKMSProvider(override)
+	if configured != nil && replacement != nil && configured.String() == replacement.String() {
+		return provider
+	}
+	return override
+}
+
+func newCloudSecretsManagerForStack(
+	info *workspace.ProjectStack, secretsProvider string, rotateSecretsProvider bool,
+	open func(context.Context, string) (*gosecrets.Keeper, error),
+) (secrets.Manager, error) {
+	// Only passphrase secrets providers use an encryption salt.
 	info.EncryptionSalt = ""
+	secretsProvider = effectiveCloudSecretsProvider(secretsProvider)
 
-	var secretsManager *Manager
-
-	// Allow per-execution override of the secrets provider via an environment
-	// variable. This allows a temporary replacement without updating the stack
-	// config, such a during CI.
-	if override := os.Getenv("PULUMI_CLOUD_SECRET_OVERRIDE"); override != "" {
-		secretsProvider = override
+	// Decode an existing wrapped key before opening the keeper.
+	ctx := context.Background()
+	dataKey, err := base64.StdEncoding.DecodeString(info.EncryptedKey)
+	needsNewKey := rotateSecretsProvider || info.EncryptedKey == "" || info.SecretsProvider != secretsProvider
+	if !needsNewKey && err != nil {
+		return nil, err
+	}
+	keeper, err := open(ctx, secretsProvider)
+	if err != nil {
+		return nil, err
 	}
 
-	// If we're rotating then just clear the key so we create a fresh one below
-	if rotateSecretsProvider {
-		info.EncryptedKey = ""
-	}
-
-	// if there is no key OR the secrets provider is changing
-	// then we need to generate the new key based on the new secrets provider
-	if info.EncryptedKey == "" || info.SecretsProvider != secretsProvider {
-		dataKey, err := generateNewDataKey(secretsProvider)
+	if needsNewKey {
+		_, dataKey, err = newWrappedDataKey(ctx, keeper)
 		if err != nil {
 			return nil, err
 		}
-		// gocloud.dev versions before v0.28.0 wrapped the
-		// data key in a base64.RawURLEncoding before wrapping
-		// it again in base64.StdEncoding.  We keep emulating
-		// this here for compatibility.
+		// Preserve the legacy Azure Key Vault encoding in stack metadata.
 		if strings.HasPrefix(secretsProvider, "azurekeyvault://") {
 			dataKey = []byte(base64.RawURLEncoding.EncodeToString(dataKey))
 		}
-		info.EncryptedKey = base64.StdEncoding.EncodeToString(dataKey)
+	}
+
+	sm, err := newCloudSecretsManagerWithKeeper(secretsProvider, dataKey, keeper)
+	if err != nil {
+		return nil, err
 	}
 	info.SecretsProvider = secretsProvider
-
-	dataKey, err := base64.StdEncoding.DecodeString(info.EncryptedKey)
-	if err != nil {
-		return nil, err
+	if needsNewKey {
+		info.EncryptedKey = base64.StdEncoding.EncodeToString(dataKey)
 	}
-
-	secretsManager, err = newCloudSecretsManager(secretsProvider, dataKey)
-	if err != nil {
-		return nil, err
-	}
-
-	return secretsManager, nil
+	return sm, nil
 }
