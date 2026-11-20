@@ -31,8 +31,8 @@ type ConfigWriter interface {
 	// CheckSet returns the error that Set would return for key whatever the value, so a caller can fail before it
 	// encrypts a secret.
 	CheckSet(ctx context.Context, key config.Key, path bool) error
-	// Call Encrypter only to write a secret: for the stack file it loads the stack secrets manager, which can prompt for a
-	// passphrase or need cloud credentials.
+	// Encrypter loads the config encrypter on demand. For a stack file, it may prompt for a passphrase or
+	// need cloud credentials.
 	Encrypter(ctx context.Context) (config.Encrypter, error)
 	Save(ctx context.Context) error
 }

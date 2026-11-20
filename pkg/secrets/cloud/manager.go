@@ -17,7 +17,6 @@ package cloud
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -77,16 +76,13 @@ func openKeeper(ctx context.Context, url string) (*gosecrets.Keeper, error) {
 // generateNewDataKey generates a new DataKey seeded by a fresh random 32-byte key and encrypted
 // using the target cloud key management service.
 func generateNewDataKey(url string) ([]byte, error) {
-	plaintextDataKey := make([]byte, 32)
-	_, err := rand.Read(plaintextDataKey)
+	ctx := context.Background()
+	keeper, err := openKeeper(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-	keeper, err := openKeeper(context.Background(), url)
-	if err != nil {
-		return nil, err
-	}
-	return keeper.Encrypt(context.Background(), plaintextDataKey)
+	_, wrapped, err := newWrappedDataKey(ctx, keeper)
+	return wrapped, err
 }
 
 // newCloudSecretsManager returns a secrets manager that uses the target cloud key management
@@ -96,15 +92,20 @@ func newCloudSecretsManager(url string, encryptedDataKey []byte) (*Manager, erro
 	if err != nil {
 		return nil, err
 	}
+	return newCloudSecretsManagerWithKeeper(url, encryptedDataKey, keeper)
+}
+
+func newCloudSecretsManagerWithKeeper(url string, encryptedDataKey []byte, keeper dataKeyUnwrapper) (*Manager, error) {
 	// We're emulating gocloud.dev's old behaviour here. Pre v0.28.0 it used to have an inner wrapping, which
 	// we keep for compatibility (see above). However the newer version expects this to be unwrapped, before
 	// it's used, so let's do that here.
 	ciphertext := encryptedDataKey
 	if strings.HasPrefix(url, "azurekeyvault://") {
-		ciphertext, err = base64.RawURLEncoding.DecodeString(string(encryptedDataKey))
+		decoded, err := base64.RawURLEncoding.DecodeString(string(encryptedDataKey))
 		if err != nil {
 			return nil, err
 		}
+		ciphertext = decoded
 	}
 	plaintextDataKey, err := keeper.Decrypt(context.Background(), ciphertext)
 	if err != nil {
@@ -118,7 +119,11 @@ func newCloudSecretsManager(url string, encryptedDataKey []byte) (*Manager, erro
 		return nil, fmt.Errorf("marshalling state: %w", err)
 	}
 	crypter := config.NewSymmetricCrypter(plaintextDataKey)
-	cachedCrypter := config.NewCiphertextToPlaintextCachedCrypter(crypter, crypter)
+	var decrypter config.Decrypter = crypter
+	if strings.HasPrefix(url, gcpKMSScheme) {
+		decrypter = gcpConfigDecrypter{legacy: crypter, keeper: keeper, stackKey: encryptedDataKey}
+	}
+	cachedCrypter := config.NewCiphertextToPlaintextCachedCrypter(crypter, decrypter)
 	return &Manager{
 		crypter: cachedCrypter,
 		state:   state,

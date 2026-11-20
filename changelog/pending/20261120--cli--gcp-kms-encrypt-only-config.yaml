@@ -1,0 +1,4 @@
+component: cli
+kind: fix
+body: Allow setting Google Cloud KMS stack config secrets with encrypt-only access
+time: 2026-11-20T19:30:00Z

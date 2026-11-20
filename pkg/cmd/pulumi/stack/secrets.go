@@ -200,19 +200,30 @@ func (l *SecretsManagerLoader) GetDecrypter(
 	return dec, state, nil
 }
 
-// Returns an encrypter for the given stack and project stack.
+// GetEncrypter returns an encrypter for the stack configuration.
 func (l *SecretsManagerLoader) GetEncrypter(
 	ctx context.Context,
 	s backend.Stack,
 	ps *workspace.ProjectStack,
 ) (config.Encrypter, SecretsManagerState, error) {
+	oldConfig := *ps
+	enc, err := cloud.NewConfigEncrypter(ctx, ps)
+	if err != nil {
+		return nil, SecretsManagerUnchanged, err
+	}
+	if enc != nil {
+		if needsSaveProjectStackAfterSecretManger(&oldConfig, ps) {
+			return enc, SecretsManagerMustSave, nil
+		}
+		return enc, SecretsManagerUnchanged, nil
+	}
+
 	sm, state, err := l.GetSecretsManager(ctx, s, ps)
 	if err != nil {
 		return nil, SecretsManagerUnchanged, err
 	}
 
-	enc := sm.Encrypter()
-	return enc, state, nil
+	return sm.Encrypter(), state, nil
 }
 
 // Returns a secrets manager for the given stack and project stack.
