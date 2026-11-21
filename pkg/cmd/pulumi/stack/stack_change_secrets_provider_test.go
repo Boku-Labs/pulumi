@@ -78,8 +78,6 @@ func mockStdin(t *testing.T, input string) {
 
 // Test that we can change the secrets provider for a stack, this sets up a mock stack using a mock secret provider and
 // then changes it to the passphrase provider, but without any existing secrets.
-//
-//nolint:paralleltest // mutates global state
 func TestChangeSecretsProvider_NoSecrets(t *testing.T) {
 	var stdoutBuff bytes.Buffer
 	secretsProvider := b64.Base64SecretsProvider.Add("passphrase", func(state json.RawMessage) (secrets.Manager, error) {

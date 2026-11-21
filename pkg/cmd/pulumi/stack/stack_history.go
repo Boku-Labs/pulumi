@@ -235,12 +235,15 @@ func decryptHistoryConfig(
 		}
 	}
 	contextual := secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	values, err := secure.Decrypt(contextual)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
 	if secrets.IsCancellationError(err) {
-		return nil, err
+		return nil, nil
 	}
 	if err == nil {
 		return values, nil
@@ -249,18 +252,24 @@ func decryptHistoryConfig(
 	// Preserve readable history values even if some keys in a batch cannot be decrypted.
 	values = make(map[config.Key]string)
 	for key, item := range secure {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
 		}
 		value, err := item.Value(contextual)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if secrets.IsCancellationError(err) {
-			return nil, err
+			break
 		}
 		if err == nil {
 			values[key] = value
 		}
 	}
-	return values, ctx.Err()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return values, nil
 }
 
 func displayUpdatesJSON(
