@@ -16,10 +16,13 @@ package config
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,9 +32,12 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	cmdBackend "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/backend"
 	cmdStack "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/stack"
+	"github.com/pulumi/pulumi/pkg/v3/engine/encryptedlog"
+	"github.com/pulumi/pulumi/pkg/v3/logging"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	"github.com/pulumi/pulumi/pkg/v3/secrets/cloud"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
@@ -567,6 +573,210 @@ func TestConfigSet(t *testing.T) {
 	}
 }
 
+func TestConfigSetSecretWithEncryptOnlyKMS(t *testing.T) {
+	const provider = "GcpKms://projects/example/locations/global/keyRings/test/cryptoKeys/config"
+	const wrappedStackKey = "d3JhcHBlZC1zdGFjay1rZXk="
+	const plaintext = "encrypt-only test value"
+
+	dir := t.TempDir()
+	t.Setenv("PULUMI_HOME", dir)
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", strings.Replace(provider, "GcpKms", "gcpkms", 1))
+	log, err := logging.StartLogging(t.Context(), nil, "config set")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, log.Close()) })
+
+	project := &workspace.Project{Name: "testProject"}
+	path := filepath.Join(dir, "Pulumi.testStack.yaml")
+	projectStack := &workspace.ProjectStack{SecretsProvider: provider, EncryptedKey: wrappedStackKey}
+	require.NoError(t, projectStack.Save(path))
+
+	encryptErr := errors.New("temporary KMS failure")
+	keeper := &encryptOnlyConfigKeeper{encryptErr: encryptErr, failEncryptAt: 1}
+	setSecret := newEncryptOnlyConfigSet(t, project, provider, path, plaintext, keeper)
+	originalConfig, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.ErrorIs(t, setSecret(), encryptErr)
+	currentConfig, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, originalConfig, currentConfig)
+	assert.Equal(t, 1, keeper.encrypts)
+
+	require.NoError(t, setSecret())
+
+	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), project, path)
+	require.NoError(t, err)
+	assert.Equal(t, wrappedStackKey, saved.EncryptedKey)
+	assert.Equal(t, provider, saved.SecretsProvider)
+	value := saved.Config[config.MustMakeKey("testProject", "test")]
+	require.True(t, value.Secure())
+	ciphertext, err := value.Value(config.NopDecrypter)
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(ciphertext, "v2:"))
+	assert.NotContains(t, ciphertext, plaintext)
+
+	logData, err := os.ReadFile(log.FilePath())
+	require.NoError(t, err)
+	assert.True(t, bytes.HasPrefix(logData, []byte(encryptedlog.Magic)))
+	assert.Equal(t, 3, keeper.encrypts, "the retry encrypts the log key and the config value")
+	assert.Zero(t, keeper.decrypts)
+}
+
+func TestConfigSetSecretContinuesOnLocalLogUpgradeFailure(t *testing.T) {
+	const provider = "gcpkms://projects/example/locations/global/keyRings/test/cryptoKeys/config"
+	const wrappedStackKey = "d3JhcHBlZC1zdGFjay1rZXk="
+
+	dir := t.TempDir()
+	t.Setenv("PULUMI_HOME", dir)
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", "")
+	project := &workspace.Project{Name: "testProject"}
+	path := filepath.Join(dir, "Pulumi.testStack.yaml")
+	projectStack := &workspace.ProjectStack{SecretsProvider: provider, EncryptedKey: wrappedStackKey}
+	require.NoError(t, projectStack.Save(path))
+
+	log, err := logging.StartLogging(t.Context(), nil, "config set")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = log.Close() })
+	_, err = io.WriteString(log, "diagnostic")
+	require.NoError(t, err)
+	// Simulate a local failure reading the current log during the upgrade.
+	f, err := os.OpenFile(log.FilePath(), os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte("bad header"), 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	keeper := &encryptOnlyConfigKeeper{}
+	setSecret := newEncryptOnlyConfigSet(t, project, provider, path, "test value", keeper)
+	require.NoError(t, setSecret())
+
+	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), project, path)
+	require.NoError(t, err)
+	assert.Equal(t, wrappedStackKey, saved.EncryptedKey)
+	assert.True(t, saved.Config[config.MustMakeKey("testProject", "test")].Secure())
+	assert.Equal(t, 2, keeper.encrypts, "prepare the log key and encrypt the config value")
+	assert.Zero(t, keeper.decrypts)
+}
+
+func TestConfigSetSecretBootstrapLogStaysReadableOnFailure(t *testing.T) {
+	const provider = "gcpkms://projects/example/locations/global/keyRings/test/cryptoKeys/config"
+	const diagnostic = "first write diagnostic"
+
+	dir := t.TempDir()
+	t.Setenv("PULUMI_HOME", dir)
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", "")
+	project := &workspace.Project{Name: "testProject"}
+	path := filepath.Join(dir, "Pulumi.testStack.yaml")
+	projectStack := &workspace.ProjectStack{SecretsProvider: provider}
+	require.NoError(t, projectStack.Save(path))
+	originalConfig, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	log, err := logging.StartLogging(t.Context(), nil, "first config set")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if log != nil {
+			require.NoError(t, log.Close())
+		}
+	})
+	_, err = io.WriteString(log, diagnostic)
+	require.NoError(t, err)
+	encryptErr := errors.New("KMS could not encrypt the config value")
+	keeper := &encryptOnlyConfigKeeper{encryptErr: encryptErr, failEncryptAt: 3}
+	setSecret := newEncryptOnlyConfigSet(t, project, provider, path, "test value", keeper)
+	require.ErrorIs(t, setSecret(), encryptErr)
+	currentConfig, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, originalConfig, currentConfig)
+	logPath := log.FilePath()
+	require.NoError(t, log.Close())
+	log = nil
+	logData, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	reader, err := gzip.NewReader(bytes.NewReader(logData))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reader.Close()) })
+	records, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	assert.Contains(t, string(records), diagnostic)
+
+	retryLog, err := logging.StartLogging(t.Context(), nil, "retry config set")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, retryLog.Close()) })
+	require.NoError(t, setSecret())
+	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), project, path)
+	require.NoError(t, err)
+	assert.NotEmpty(t, saved.EncryptedKey)
+	assert.True(t, saved.Config[config.MustMakeKey("testProject", "test")].Secure())
+	logData, err = os.ReadFile(retryLog.FilePath())
+	require.NoError(t, err)
+	assert.True(t, bytes.HasPrefix(logData, []byte(encryptedlog.Magic)))
+	assert.Zero(t, keeper.decrypts)
+}
+
+func newEncryptOnlyConfigSet(
+	t *testing.T, project *workspace.Project, provider, path, plaintext string, keeper cloud.ConfigKMSKeeper,
+) func() error {
+	t.Helper()
+
+	ref := &backend.MockStackReference{
+		NameV:               tokens.MustParseStackName("testStack"),
+		FullyQualifiedNameV: "org/testProject/testStack",
+	}
+	stack := &backend.MockStack{
+		RefF:            func() backend.StackReference { return ref },
+		ConfigLocationF: func() backend.StackConfigLocation { return backend.StackConfigLocation{} },
+	}
+	b := &backend.MockBackend{
+		ParseStackReferenceF: func(string) (backend.StackReference, error) { return ref, nil },
+		GetStackF:            func(context.Context, backend.StackReference) (backend.Stack, error) { return stack, nil },
+	}
+	lm := &cmdBackend.MockLoginManager{
+		LoginF: func(
+			_ context.Context, _ pkgWorkspace.Context, _ diag.Sink, _ string, _ *workspace.Project,
+			_ bool, _ bool, _ colors.Colorization, _ ...cmdBackend.LoginOption,
+		) (backend.Backend, error) {
+			return b, nil
+		},
+	}
+	ws := &pkgWorkspace.MockContext{
+		ReadProjectF: func(string) (*workspace.Project, string, error) { return project, filepath.Dir(path), nil },
+	}
+
+	set := &configSetCmd{
+		LoadProjectStack: cmdStack.LoadProjectStack,
+		secretsManagerLoader: &cmdStack.SecretsManagerLoader{
+			OpenConfigKMSKeeper: func(_ context.Context, url string) (cloud.ConfigKMSKeeper, error) {
+				require.Equal(t, provider, url)
+				return keeper, nil
+			},
+		},
+	}
+	stackName := ref.Name().String()
+	cmd := set.command(ws, &stackName, lm, &path)
+	cmd.SetArgs([]string{"--secret", "testProject:test", plaintext})
+	return func() error { return cmd.ExecuteContext(t.Context()) }
+}
+
+type encryptOnlyConfigKeeper struct {
+	encryptErr    error
+	failEncryptAt int
+	encrypts      int
+	decrypts      int
+}
+
+func (k *encryptOnlyConfigKeeper) Encrypt(_ context.Context, key []byte) ([]byte, error) {
+	k.encrypts++
+	if k.encrypts == k.failEncryptAt {
+		return nil, k.encryptErr
+	}
+	return append([]byte("wrapped:"), key...), nil
+}
+
+func (k *encryptOnlyConfigKeeper) Decrypt(context.Context, []byte) ([]byte, error) {
+	k.decrypts++
+	return nil, errors.New("KMS Decrypt denied")
+}
+
 func TestConfigSetTypes(t *testing.T) {
 	t.Parallel()
 
@@ -842,11 +1052,16 @@ func TestConfigSetAll(t *testing.T) {
 				},
 			}
 
-			// Create mock encrypter factory
+			batches := 0
 			mockEncrypterFactory := &mockEncrypterFactory{
 				encrypter: &secrets.MockEncrypter{
-					EncryptValueF: func(plaintext string) string {
-						return base64.StdEncoding.EncodeToString([]byte(plaintext))
+					BatchEncryptF: func(plaintexts []string) []string {
+						batches++
+						ciphertexts := make([]string, len(plaintexts))
+						for i, plaintext := range plaintexts {
+							ciphertexts[i] = base64.StdEncoding.EncodeToString([]byte(plaintext))
+						}
+						return ciphertexts
 					},
 				},
 			}
@@ -875,6 +1090,13 @@ func TestConfigSetAll(t *testing.T) {
 
 			// Execute the command
 			err := cmd.RunE(cmd, []string{})
+			if c.expectError == "" {
+				wantBatches := 0
+				if len(c.secretArgs) > 0 || strings.Contains(c.jsonArg, `"secret": true`) {
+					wantBatches = 1
+				}
+				assert.Equal(t, wantBatches, batches)
+			}
 
 			// Check for expected error
 			if c.expectError != "" {

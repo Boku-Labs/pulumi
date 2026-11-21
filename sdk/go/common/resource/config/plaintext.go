@@ -142,12 +142,12 @@ func (c Plaintext) PropertyValue() property.Value {
 func encryptMap(ctx context.Context, plaintextMap map[Key]Plaintext, encrypter Encrypter) (map[Key]object, error) {
 	// Collect all secure values
 	var refs []containerRef
-	var ptChunks [][]string
+	var ptChunks valueChunks
 	collectPlaintextSecrets(plaintextMap, &refs, &ptChunks)
 
 	// Encrypt objects in batches
 	offset := 0
-	for _, ptChunk := range ptChunks {
+	for _, ptChunk := range ptChunks.chunks {
 		if len(ptChunk) == 0 {
 			continue
 		}

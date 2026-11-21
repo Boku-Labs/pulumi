@@ -17,14 +17,19 @@ package stack
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/display"
+	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/stretchr/testify/require"
+	"gocloud.dev/gcerrors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestBuildUpdatesJSONWithFailedDecryptedSecureObject(t *testing.T) {
@@ -52,8 +57,73 @@ func TestBuildUpdatesJSONWithFailedDecryptedSecureObject(t *testing.T) {
 		},
 	}
 
-	_, err := buildUpdatesJSON(update, mockDecrypter)
-	require.NoError(t, err, "Expected config to not error and substitute ERROR_UNABLE_TO_DECRYPT")
+	result, err := buildUpdatesJSON(t.Context(), update, mockDecrypter)
+	require.NoError(t, err)
+	require.Equal(t, errorDecryptingValue, *result[0].Config["test:key2"].Value)
+}
+
+func TestBuildUpdatesJSONBatchesSecretsAndCancels(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Map{
+		config.MustMakeKey("test", "first"):  config.NewSecureValue("first"),
+		config.MustMakeKey("test", "second"): config.NewSecureValue("second"),
+	}
+	updates := []backend.UpdateInfo{{Config: cfg}}
+	calls := 0
+	decrypter := historyBatchDecrypter{batch: func(_ context.Context, ciphertexts []string) ([]string, error) {
+		calls++
+		require.ElementsMatch(t, []string{"first", "second"}, ciphertexts)
+		return ciphertexts, nil
+	}}
+	result, err := buildUpdatesJSON(t.Context(), updates, decrypter)
+	require.NoError(t, err)
+	require.Equal(t, 1, calls)
+	require.Equal(t, "first", *result[0].Config["test:first"].Value)
+	require.Equal(t, "second", *result[0].Config["test:second"].Value)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	decrypter.batch = func(ctx context.Context, _ []string) ([]string, error) {
+		cancel()
+		return nil, ctx.Err()
+	}
+	_, err = buildUpdatesJSON(ctx, updates, decrypter)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestBuildUpdatesJSONDoesNotRetryProviderCancellation(t *testing.T) {
+	t.Parallel()
+
+	updates := []backend.UpdateInfo{{Config: config.Map{
+		config.MustMakeKey("test", "first"):  config.NewSecureValue("first"),
+		config.MustMakeKey("test", "second"): config.NewSecureValue("second"),
+	}}}
+	for _, cause := range []error{gcerrors.ErrCanceled, status.Error(codes.DeadlineExceeded, "KMS deadline expired")} {
+		providerErr := fmt.Errorf("decrypting configuration: %w", cause)
+		retries := 0
+		decrypter := historyBatchDecrypter{
+			Decrypter: &secrets.MockDecrypter{DecryptValueF: func(value string) string {
+				retries++
+				return value
+			}},
+			batch: func(context.Context, []string) ([]string, error) {
+				return nil, providerErr
+			},
+		}
+		_, err := buildUpdatesJSON(t.Context(), updates, decrypter)
+		require.ErrorIs(t, err, providerErr)
+		require.Zero(t, retries)
+	}
+}
+
+type historyBatchDecrypter struct {
+	config.Decrypter
+	batch func(context.Context, []string) ([]string, error)
+}
+
+func (d historyBatchDecrypter) BatchDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
+	return d.batch(ctx, ciphertexts)
 }
 
 type failingDecrypter struct{}

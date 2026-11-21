@@ -641,7 +641,7 @@ func Update(u UpdateInfo, ctx *Context, opts UpdateOptions, dryRun bool) (
 	}
 	defer info.Close()
 
-	emitter, err := makeEventEmitter(ctx.Events, u)
+	emitter, err := makeEventEmitter(ctx.Cancel.Base(), ctx.Events, u)
 	if err != nil {
 		return nil, nil, err
 	}

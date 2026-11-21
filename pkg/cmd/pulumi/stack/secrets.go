@@ -70,16 +70,7 @@ func CreateSecretsManagerForExistingStack(
 	}
 
 	oldConfig := deepcopy.Copy(ps).(*workspace.ProjectStack)
-	if isDefaultSecretsProvider {
-		_, err = stack.DefaultSecretManager(ctx, ps)
-	} else if secretsProvider == passphrase.Type {
-		_, err = passphrase.NewPromptingPassphraseSecretsManager(ps, rotateSecretsProvider)
-	} else {
-		// All other non-default secrets providers are handled by the cloud secrets provider which
-		// uses a URL schema to identify the provider
-		_, err = cloud.NewCloudSecretsManager(ps, secretsProvider, rotateSecretsProvider)
-	}
-	if err != nil {
+	if _, err = configureSecretsManager(ctx, stack, ps, secretsProvider, rotateSecretsProvider); err != nil {
 		return err
 	}
 
@@ -91,6 +82,19 @@ func CreateSecretsManagerForExistingStack(
 	}
 
 	return nil
+}
+
+func configureSecretsManager(
+	ctx context.Context, stack backend.Stack, ps *workspace.ProjectStack, provider string, rotate bool,
+) (secrets.Manager, error) {
+	switch provider {
+	case "", "default":
+		return stack.DefaultSecretManager(ctx, ps)
+	case passphrase.Type:
+		return passphrase.NewPromptingPassphraseSecretsManager(ps, rotate)
+	default:
+		return cloud.NewCloudSecretsManager(ps, provider, rotate)
+	}
 }
 
 // Creates a secrets manager for a new stack. If a stack configuration already exists (e.g. the user has created a
@@ -158,6 +162,9 @@ type SecretsManagerLoader struct {
 	// True if the loader should fallback to the stack state if there is no
 	// secrets manager configured in the project stack.
 	FallbackToState bool
+
+	// OpenConfigKMSKeeper overrides the Cloud KMS client used for configuration writes.
+	OpenConfigKMSKeeper func(context.Context, string) (cloud.ConfigKMSKeeper, error)
 }
 
 // The state of a stack's secret manager configuration following an operation.
@@ -200,19 +207,54 @@ func (l *SecretsManagerLoader) GetDecrypter(
 	return dec, state, nil
 }
 
-// Returns an encrypter for the given stack and project stack.
+// GetEncrypter returns an encrypter for the stack configuration.
 func (l *SecretsManagerLoader) GetEncrypter(
 	ctx context.Context,
 	s backend.Stack,
 	ps *workspace.ProjectStack,
 ) (config.Encrypter, SecretsManagerState, error) {
+	oldConfig := *ps
+	enc, err := cloud.NewConfigEncrypter(ctx, ps, l.OpenConfigKMSKeeper)
+	if err != nil {
+		return nil, SecretsManagerUnchanged, err
+	}
+	if enc != nil {
+		fqn := string(s.Ref().FullyQualifiedName())
+		upgrade, err := pkgLogging.PrepareCurrentLoggerUpgrade(ctx, fqn, "", enc)
+		if err != nil {
+			return nil, SecretsManagerUnchanged, fmt.Errorf("encrypting command diagnostics: %w", err)
+		}
+		if upgrade != nil {
+			if oldConfig.EncryptedKey != ps.EncryptedKey {
+				// The old log format stays readable until the new wrapped key is saved.
+				enc = deferredLogUpgradeEncrypter{Encrypter: enc, upgrade: upgrade}
+			} else {
+				finishConfigLogUpgrade(ctx, upgrade)
+			}
+		}
+		if needsSaveProjectStackAfterSecretManger(&oldConfig, ps) {
+			return enc, SecretsManagerMustSave, nil
+		}
+		return enc, SecretsManagerUnchanged, nil
+	}
+
 	sm, state, err := l.GetSecretsManager(ctx, s, ps)
 	if err != nil {
 		return nil, SecretsManagerUnchanged, err
 	}
 
-	enc := sm.Encrypter()
-	return enc, state, nil
+	return sm.Encrypter(), state, nil
+}
+
+type deferredLogUpgradeEncrypter struct {
+	config.Encrypter
+	upgrade func() error
+}
+
+func finishConfigLogUpgrade(ctx context.Context, upgrade func() error) {
+	if err := upgrade(); err != nil {
+		slog.InfoContext(ctx, "encrypted log upgrade failed", "err", err)
+	}
 }
 
 // Returns a secrets manager for the given stack and project stack.
@@ -305,12 +347,15 @@ func (l *SecretsManagerLoader) GetSecretsManager(
 
 	bsm := stack.NewBatchingCachingSecretsManager(sm)
 
+	upgradeStackLogger(ctx, s, bsm)
+	return bsm, state, nil
+}
+
+func upgradeStackLogger(ctx context.Context, s backend.Stack, sm secrets.Manager) {
 	fqn := string(s.Ref().FullyQualifiedName())
-	if err := pkgLogging.UpgradeCurrentLogger(ctx, fqn, "", bsm); err != nil {
+	if err := pkgLogging.UpgradeCurrentLogger(ctx, fqn, "", sm); err != nil {
 		slog.InfoContext(ctx, "encrypted log upgrade failed", "err", err)
 	}
-
-	return bsm, state, nil
 }
 
 func needsSaveProjectStackAfterSecretManger(

@@ -15,6 +15,7 @@
 package stack
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,6 +33,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/cmd"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/constrictor"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/ui"
+	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/pkg/v3/util/outputflag"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
@@ -41,7 +43,9 @@ import (
 
 const errorDecryptingValue = "ERROR_UNABLE_TO_DECRYPT"
 
-type stackHistoryRenderFunc func(w io.Writer, updates []backend.UpdateInfo, decrypter config.Decrypter) error
+type stackHistoryRenderFunc func(
+	ctx context.Context, w io.Writer, updates []backend.UpdateInfo, decrypter config.Decrypter,
+) error
 
 func newStackHistoryCmd() *cobra.Command {
 	var stack string
@@ -51,7 +55,7 @@ func newStackHistoryCmd() *cobra.Command {
 	var showFullDates bool
 
 	output := outputflag.OutputFlag[stackHistoryRenderFunc]{
-		RenderForTerminal: func(w io.Writer, updates []backend.UpdateInfo, _ config.Decrypter) error {
+		RenderForTerminal: func(_ context.Context, w io.Writer, updates []backend.UpdateInfo, _ config.Decrypter) error {
 			return displayUpdatesConsole(w, updates, page,
 				display.Options{Color: cmdutil.GetGlobalColorization()}, showFullDates)
 		},
@@ -117,7 +121,7 @@ This command displays data about previous updates for a stack.`,
 				Log3rdPartySecretsProviderDecryptionEvent(ctx, s, "", "pulumi stack history")
 			}
 
-			return output.Get()(cmd.OutOrStdout(), updates, decrypter)
+			return output.Get()(ctx, cmd.OutOrStdout(), updates, decrypter)
 		},
 	}
 
@@ -166,7 +170,9 @@ type configValueJSON struct {
 	Secret      bool    `json:"secret"`
 }
 
-func buildUpdatesJSON(updates []backend.UpdateInfo, decrypter config.Decrypter) ([]updateInfoJSON, error) {
+func buildUpdatesJSON(
+	ctx context.Context, updates []backend.UpdateInfo, decrypter config.Decrypter,
+) ([]updateInfoJSON, error) {
 	updatesJSON := make([]updateInfoJSON, len(updates))
 	for idx, update := range updates {
 		info := updateInfoJSON{
@@ -177,28 +183,27 @@ func buildUpdatesJSON(updates []backend.UpdateInfo, decrypter config.Decrypter) 
 			Environment: update.Environment,
 		}
 
+		decrypted, err := decryptHistoryConfig(ctx, update.Config, decrypter)
+		if err != nil {
+			return nil, err
+		}
 		info.Config = make(map[string]configValueJSON)
 		for k, v := range update.Config {
-			configValue := configValueJSON{
-				Secret: v.Secure(),
+			configValue := configValueJSON{Secret: v.Secure()}
+			value, ok := decrypted[k]
+			if !v.Secure() {
+				value, err = v.Value(nil)
+				ok = err == nil
 			}
-			if !v.Secure() || (v.Secure() && decrypter != nil) {
-				value, err := v.Value(decrypter)
-				if err != nil {
-					// We don't actually want to error here
-					// we are just going to mark as "UNKNOWN" and then let the command continue
-					configValue.Value = new(errorDecryptingValue)
-				} else {
-					configValue.Value = new(value)
-
-					if value != "" && v.Object() {
-						var obj any
-						if err := json.Unmarshal([]byte(value), &obj); err != nil {
-							return nil, err
-						}
-						configValue.ObjectValue = obj
+			if ok {
+				configValue.Value = new(value)
+				if value != "" && v.Object() {
+					if err := json.Unmarshal([]byte(value), &configValue.ObjectValue); err != nil {
+						return nil, err
 					}
 				}
+			} else if !v.Secure() || decrypter != nil {
+				configValue.Value = new(errorDecryptingValue)
 			}
 			info.Config[k.String()] = configValue
 		}
@@ -217,8 +222,51 @@ func buildUpdatesJSON(updates []backend.UpdateInfo, decrypter config.Decrypter) 
 	return updatesJSON, nil
 }
 
-func displayUpdatesJSON(w io.Writer, updates []backend.UpdateInfo, decrypter config.Decrypter) error {
-	updatesJSON, err := buildUpdatesJSON(updates, decrypter)
+func decryptHistoryConfig(
+	ctx context.Context, cfg config.Map, decrypter config.Decrypter,
+) (map[config.Key]string, error) {
+	if decrypter == nil {
+		return nil, ctx.Err()
+	}
+	secure := make(config.Map)
+	for key, value := range cfg {
+		if value.Secure() {
+			secure[key] = value
+		}
+	}
+	contextual := secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter}
+	values, err := secure.Decrypt(contextual)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if secrets.IsCancellationError(err) {
+		return nil, err
+	}
+	if err == nil {
+		return values, nil
+	}
+
+	// Preserve readable history values even if some keys in a batch cannot be decrypted.
+	values = make(map[config.Key]string)
+	for key, item := range secure {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		value, err := item.Value(contextual)
+		if secrets.IsCancellationError(err) {
+			return nil, err
+		}
+		if err == nil {
+			values[key] = value
+		}
+	}
+	return values, ctx.Err()
+}
+
+func displayUpdatesJSON(
+	ctx context.Context, w io.Writer, updates []backend.UpdateInfo, decrypter config.Decrypter,
+) error {
+	updatesJSON, err := buildUpdatesJSON(ctx, updates, decrypter)
 	if err != nil {
 		return err
 	}
