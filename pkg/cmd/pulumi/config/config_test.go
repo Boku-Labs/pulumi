@@ -16,11 +16,13 @@ package config
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -588,6 +590,98 @@ func TestConfigSetSecretWithEncryptOnlyKMS(t *testing.T) {
 	projectStack := &workspace.ProjectStack{SecretsProvider: provider, EncryptedKey: wrappedStackKey}
 	require.NoError(t, projectStack.Save(path))
 
+	encryptErr := errors.New("temporary KMS failure")
+	keeper := &encryptOnlyConfigKeeper{encryptErr: encryptErr, failEncryptAt: 1}
+	setSecret := newEncryptOnlyConfigSet(t, project, provider, path, plaintext, keeper)
+	originalConfig, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.ErrorIs(t, setSecret(), encryptErr)
+	currentConfig, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, originalConfig, currentConfig)
+	assert.Equal(t, 1, keeper.encrypts)
+
+	require.NoError(t, setSecret())
+
+	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), project, path)
+	require.NoError(t, err)
+	assert.Equal(t, wrappedStackKey, saved.EncryptedKey)
+	assert.Equal(t, provider, saved.SecretsProvider)
+	value := saved.Config[config.MustMakeKey("testProject", "test")]
+	require.True(t, value.Secure())
+	ciphertext, err := value.Value(config.NopDecrypter)
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(ciphertext, "v2:"))
+	assert.NotContains(t, ciphertext, plaintext)
+
+	logData, err := os.ReadFile(log.FilePath())
+	require.NoError(t, err)
+	assert.True(t, bytes.HasPrefix(logData, []byte(encryptedlog.Magic)))
+	assert.Equal(t, 3, keeper.encrypts, "the retry encrypts the log key and the config value")
+	assert.Zero(t, keeper.decrypts)
+}
+
+func TestConfigSetSecretBootstrapLogStaysReadableOnFailure(t *testing.T) {
+	const provider = "gcpkms://projects/example/locations/global/keyRings/test/cryptoKeys/config"
+	const diagnostic = "first write diagnostic"
+
+	dir := t.TempDir()
+	t.Setenv("PULUMI_HOME", dir)
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", "")
+	project := &workspace.Project{Name: "testProject"}
+	path := filepath.Join(dir, "Pulumi.testStack.yaml")
+	projectStack := &workspace.ProjectStack{SecretsProvider: provider}
+	require.NoError(t, projectStack.Save(path))
+	originalConfig, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	log, err := logging.StartLogging(t.Context(), nil, "first config set")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if log != nil {
+			require.NoError(t, log.Close())
+		}
+	})
+	_, err = io.WriteString(log, diagnostic)
+	require.NoError(t, err)
+	encryptErr := errors.New("KMS could not encrypt the config value")
+	keeper := &encryptOnlyConfigKeeper{encryptErr: encryptErr, failEncryptAt: 3}
+	setSecret := newEncryptOnlyConfigSet(t, project, provider, path, "test value", keeper)
+	require.ErrorIs(t, setSecret(), encryptErr)
+	currentConfig, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, originalConfig, currentConfig)
+	logPath := log.FilePath()
+	require.NoError(t, log.Close())
+	log = nil
+	logData, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	reader, err := gzip.NewReader(bytes.NewReader(logData))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reader.Close()) })
+	records, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	assert.Contains(t, string(records), diagnostic)
+
+	retryLog, err := logging.StartLogging(t.Context(), nil, "retry config set")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, retryLog.Close()) })
+	require.NoError(t, setSecret())
+	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), project, path)
+	require.NoError(t, err)
+	assert.NotEmpty(t, saved.EncryptedKey)
+	assert.True(t, saved.Config[config.MustMakeKey("testProject", "test")].Secure())
+	logData, err = os.ReadFile(retryLog.FilePath())
+	require.NoError(t, err)
+	assert.True(t, bytes.HasPrefix(logData, []byte(encryptedlog.Magic)))
+	assert.Zero(t, keeper.decrypts)
+}
+
+func newEncryptOnlyConfigSet(
+	t *testing.T, project *workspace.Project, provider, path, plaintext string, keeper cloud.ConfigKMSKeeper,
+) func() error {
+	t.Helper()
+
 	ref := &backend.MockStackReference{
 		NameV:               tokens.MustParseStackName("testStack"),
 		FullyQualifiedNameV: "org/testProject/testStack",
@@ -609,11 +703,9 @@ func TestConfigSetSecretWithEncryptOnlyKMS(t *testing.T) {
 		},
 	}
 	ws := &pkgWorkspace.MockContext{
-		ReadProjectF: func(string) (*workspace.Project, string, error) { return project, dir, nil },
+		ReadProjectF: func(string) (*workspace.Project, string, error) { return project, filepath.Dir(path), nil },
 	}
 
-	encryptErr := errors.New("temporary KMS failure")
-	keeper := &encryptOnlyConfigKeeper{nextEncryptErr: encryptErr}
 	set := &configSetCmd{
 		LoadProjectStack: cmdStack.LoadProjectStack,
 		secretsManagerLoader: &cmdStack.SecretsManagerLoader{
@@ -626,45 +718,20 @@ func TestConfigSetSecretWithEncryptOnlyKMS(t *testing.T) {
 	stackName := ref.Name().String()
 	cmd := set.command(ws, &stackName, lm, &path)
 	cmd.SetArgs([]string{"--secret", "testProject:test", plaintext})
-	originalConfig, err := os.ReadFile(path)
-	require.NoError(t, err)
-	require.ErrorIs(t, cmd.ExecuteContext(t.Context()), encryptErr)
-	currentConfig, err := os.ReadFile(path)
-	require.NoError(t, err)
-	assert.Equal(t, originalConfig, currentConfig)
-	assert.Equal(t, 1, keeper.encrypts)
-
-	require.NoError(t, cmd.ExecuteContext(t.Context()))
-
-	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), project, path)
-	require.NoError(t, err)
-	assert.Equal(t, wrappedStackKey, saved.EncryptedKey)
-	assert.Equal(t, provider, saved.SecretsProvider)
-	value := saved.Config[config.MustMakeKey("testProject", "test")]
-	require.True(t, value.Secure())
-	ciphertext, err := value.Value(config.NopDecrypter)
-	require.NoError(t, err)
-	assert.True(t, strings.HasPrefix(ciphertext, "v2:"))
-	assert.NotContains(t, ciphertext, plaintext)
-
-	logData, err := os.ReadFile(log.FilePath())
-	require.NoError(t, err)
-	assert.True(t, bytes.HasPrefix(logData, []byte(encryptedlog.Magic)))
-	assert.Equal(t, 3, keeper.encrypts, "the retry encrypts the log key and the config value")
-	assert.Zero(t, keeper.decrypts)
+	return func() error { return cmd.ExecuteContext(t.Context()) }
 }
 
 type encryptOnlyConfigKeeper struct {
-	nextEncryptErr error
-	encrypts       int
-	decrypts       int
+	encryptErr    error
+	failEncryptAt int
+	encrypts      int
+	decrypts      int
 }
 
 func (k *encryptOnlyConfigKeeper) Encrypt(_ context.Context, key []byte) ([]byte, error) {
 	k.encrypts++
-	if err := k.nextEncryptErr; err != nil {
-		k.nextEncryptErr = nil
-		return nil, err
+	if k.encrypts == k.failEncryptAt {
+		return nil, k.encryptErr
 	}
 	return append([]byte("wrapped:"), key...), nil
 }

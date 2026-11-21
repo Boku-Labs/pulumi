@@ -275,25 +275,16 @@ func (cmd *stackNewCmd) Run(ctx context.Context, args []string) error {
 		}
 
 		// copy the config from the old to the new
-		requiresSaving, err := CopyEntireConfigMap(
+		if err := CopyEntireConfigMap(
 			ctx,
 			ssml,
 			copyStack,
 			copyProjectStack,
 			newStack,
 			newProjectStack,
-		)
-		if err != nil {
+			"",
+		); err != nil {
 			return err
-		}
-
-		// The use of `requiresSaving` here ensures that there was actually some config
-		// that needed saved, otherwise it's an unnecessary save call
-		if requiresSaving {
-			err := SaveProjectStack(ctx, newStack, newProjectStack, "")
-			if err != nil {
-				return err
-			}
 		}
 	}
 

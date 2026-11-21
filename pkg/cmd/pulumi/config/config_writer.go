@@ -75,6 +75,7 @@ type stackFileWriter struct {
 	ps         *workspace.ProjectStack
 	configFile string
 	ef         encrypterFactory
+	encrypter  config.Encrypter
 }
 
 func (w *stackFileWriter) Set(_ context.Context, key config.Key, v config.Value, path bool) error {
@@ -90,11 +91,16 @@ func (w *stackFileWriter) Remove(_ context.Context, key config.Key, path bool) e
 }
 
 func (w *stackFileWriter) Encrypter(ctx context.Context) (config.Encrypter, error) {
-	// The command always saves afterwards, so whether GetEncrypter changed the stack file does not matter.
+	if w.encrypter != nil {
+		return w.encrypter, nil
+	}
 	enc, _, err := w.ef.GetEncrypter(ctx, w.stack, w.ps)
+	if err == nil {
+		w.encrypter = enc
+	}
 	return enc, err
 }
 
 func (w *stackFileWriter) Save(ctx context.Context) error {
-	return cmdStack.SaveProjectStack(ctx, w.stack, w.ps, w.configFile)
+	return cmdStack.SaveProjectStackWithEncrypter(ctx, w.stack, w.ps, w.configFile, w.encrypter)
 }

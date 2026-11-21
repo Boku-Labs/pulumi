@@ -462,7 +462,7 @@ func copySingleConfigKey(
 		return err
 	}
 
-	return cmdStack.SaveProjectStack(ctx, destinationStack, destinationProjectStack, configFile)
+	return cmdStack.SaveProjectStackWithEncrypter(ctx, destinationStack, destinationProjectStack, configFile, encrypter)
 }
 
 type configCopyEncrypter struct {

@@ -281,28 +281,15 @@ func newConfigCopyCmd(
 				)
 			}
 
-			requiresSaving, err := cmdStack.CopyEntireConfigMap(
+			return cmdStack.CopyEntireConfigMap(
 				ctx,
 				ssml,
 				currentStack,
 				currentProjectStack,
 				destinationStack,
 				destinationProjectStack,
+				*configFile,
 			)
-			if err != nil {
-				return err
-			}
-
-			// The use of `requiresSaving` here ensures that there was actually some config
-			// that needed saved, otherwise it's an unnecessary save call
-			if requiresSaving {
-				err := cmdStack.SaveProjectStack(ctx, destinationStack, destinationProjectStack, *configFile)
-				if err != nil {
-					return err
-				}
-			}
-
-			return nil
 		},
 	}
 

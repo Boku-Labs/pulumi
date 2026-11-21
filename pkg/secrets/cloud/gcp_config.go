@@ -90,11 +90,12 @@ func NewConfigEncrypter(
 func newGCPConfigEncrypter(
 	ctx context.Context, ps *workspace.ProjectStack, keeper ConfigKMSKeeper,
 ) (config.Encrypter, error) {
+	existingStackKey := ps.EncryptedKey != ""
 	stackKey, err := base64.StdEncoding.DecodeString(ps.EncryptedKey)
 	if err != nil {
 		return nil, fmt.Errorf("decoding wrapped stack key: %w", err)
 	}
-	if ps.EncryptedKey == "" {
+	if !existingStackKey {
 		if ps.Config.HasSecureValue() {
 			return nil, errors.New("cannot initialize a wrapped stack key while encrypted configuration exists")
 		}
@@ -108,7 +109,7 @@ func newGCPConfigEncrypter(
 		return nil, errors.New("missing wrapped stack key")
 	}
 	ps.EncryptionSalt = ""
-	return &gcpConfigEncrypter{keeper: keeper, stackKey: stackKey}, nil
+	return &gcpConfigEncrypter{keeper: keeper, stackKey: stackKey, existingStackKey: existingStackKey}, nil
 }
 
 func newWrappedDataKey(ctx context.Context, keeper dataKeyWrapper) (key, wrapped []byte, err error) {
@@ -126,27 +127,34 @@ func newWrappedDataKey(ctx context.Context, keeper dataKeyWrapper) (key, wrapped
 // The envelope stores a KMS-wrapped data key and a nonce-prefixed AES-GCM
 // ciphertext. The wrapped stack key binds the value to its stack's encryption key.
 type gcpConfigEncrypter struct {
-	keeper        ConfigKMSKeeper
-	stackKey      []byte
-	encryptDenied atomic.Bool
-	legacyMu      sync.Mutex
-	legacy        config.Encrypter
+	keeper           ConfigKMSKeeper
+	stackKey         []byte
+	existingStackKey bool
+	useLegacy        atomic.Bool
+	legacyMu         sync.Mutex
+	legacy           config.Encrypter
 }
 
 func (e *gcpConfigEncrypter) EncryptValue(ctx context.Context, plaintext string) (string, error) {
-	if !e.encryptDenied.Load() {
+	var encryptErr error
+	if !e.useLegacy.Load() {
 		ciphertext, err := e.encryptEnvelope(ctx, plaintext)
-		if status.Code(err) != codes.PermissionDenied {
+		code := status.Code(err)
+		// A disabled primary can prevent new wraps while an older version can still unwrap the stack key.
+		if code != codes.PermissionDenied && (code != codes.FailedPrecondition || !e.existingStackKey) {
 			return ciphertext, err
 		}
-		e.encryptDenied.Store(true)
+		encryptErr = err
 	}
 
-	// A decrypt-only identity can still use the original stack data key.
 	legacy, err := e.legacyEncrypter(ctx)
 	if err != nil {
-		return "", fmt.Errorf("KMS Encrypt was denied and the stack key could not be decrypted: %w", err)
+		if encryptErr != nil {
+			return "", fmt.Errorf("KMS Encrypt failed (%w) and the stack key could not be decrypted: %w", encryptErr, err)
+		}
+		return "", err
 	}
+	e.useLegacy.Store(true)
 	return legacy.EncryptValue(ctx, plaintext)
 }
 

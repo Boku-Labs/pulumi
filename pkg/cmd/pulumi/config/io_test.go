@@ -591,20 +591,24 @@ func TestCopyConfig(t *testing.T) {
 		err := yaml.Unmarshal([]byte("environment:\n  - test2"), &destinationProjectStack)
 		require.NoError(t, err)
 
-		requiresSaving, err := stack.CopyEntireConfigMap(
+		configPath := filepath.Join(t.TempDir(), "Pulumi.mystack2.yaml")
+		err = stack.CopyEntireConfigMap(
 			t.Context(),
 			stack.SecretsManagerLoader{},
 			sourceStack,
 			&sourceProjectStack,
 			destinationStack,
 			&destinationProjectStack,
+			configPath,
 		)
 		require.NoError(t, err)
-		assert.True(t, requiresSaving, "expected config file changes requiring saving")
+		saved, err := workspace.LoadProjectStack(
+			cmdutil.Diag(), &workspace.Project{Name: "project"}, configPath)
+		require.NoError(t, err)
 
 		// Assert that only the source stack's environment
 		// remains in the destination stack.
-		envImports := destinationProjectStack.Environment.Imports()
+		envImports := saved.Environment.Imports()
 		assert.Contains(t, envImports, "test")
 		assert.NotContains(t, envImports, "test2")
 	})
@@ -628,9 +632,9 @@ func TestCopyPlaintextConfigDoesNotLoadKMS(t *testing.T) {
 	}
 
 	bulk := destination()
-	changed, err := stack.CopyEntireConfigMap(t.Context(), loader, nil, source, nil, bulk)
+	bulkPath := filepath.Join(t.TempDir(), "Pulumi.dev.yaml")
+	err := stack.CopyEntireConfigMap(t.Context(), loader, nil, source, nil, bulk, bulkPath)
 	require.NoError(t, err)
-	require.True(t, changed)
 	assert.Equal(t, source.Config, bulk.Config)
 	assert.Empty(t, bulk.EncryptedKey)
 

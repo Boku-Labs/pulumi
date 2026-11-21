@@ -54,6 +54,13 @@ func UpgradeCurrentLoggerWithEncrypter(
 	return currentLogger.upgradeToEncrypted(ctx, stackName, updateID, encrypter)
 }
 
+// PrepareCurrentLoggerUpgrade wraps a session key and returns the pending log upgrade.
+func PrepareCurrentLoggerUpgrade(
+	ctx context.Context, stackName, updateID string, encrypter config.Encrypter,
+) (func() error, error) {
+	return currentLogger.prepareUpgrade(ctx, stackName, updateID, encrypter)
+}
+
 // RenameCurrentLogger renames the current log file to include the given
 // stack name and update ID. This is useful when the update ID becomes
 // available after the logger has already been upgraded to encrypted mode.
@@ -163,15 +170,25 @@ func (l *Logger) UpgradeToEncrypted(ctx context.Context, stackName, updateID str
 func (l *Logger) upgradeToEncrypted(
 	ctx context.Context, stackName, updateID string, encrypter config.Encrypter,
 ) error {
+	upgrade, err := l.prepareUpgrade(ctx, stackName, updateID, encrypter)
+	if err != nil || upgrade == nil {
+		return err
+	}
+	return upgrade()
+}
+
+func (l *Logger) prepareUpgrade(
+	ctx context.Context, stackName, updateID string, encrypter config.Encrypter,
+) (func() error, error) {
 	if l == nil || encrypter == nil {
-		return nil
+		return nil, nil
 	}
 
 	l.mu.Lock()
 	encrypted := l.encrypted
 	l.mu.Unlock()
 	if encrypted {
-		return nil
+		return nil, nil
 	}
 
 	// Prepare the encrypted session key *before* taking l.mu. This step calls
@@ -179,9 +196,13 @@ func (l *Logger) upgradeToEncrypted(
 	// take the mutex itself.
 	key, err := encryptedlog.PrepareKey(ctx, encrypter)
 	if err != nil {
-		return fmt.Errorf("preparing encrypted log key: %w", err)
+		return nil, fmt.Errorf("preparing encrypted log key: %w", err)
 	}
 
+	return func() error { return l.upgradeWithKey(stackName, updateID, key) }, nil
+}
+
+func (l *Logger) upgradeWithKey(stackName, updateID string, key *encryptedlog.PreparedKey) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 

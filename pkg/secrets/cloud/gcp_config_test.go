@@ -147,6 +147,41 @@ func TestGCPConfigDecryptOnlyWriter(t *testing.T) {
 	assert.Equal(t, []string{"first value", "second value", "third value"}, plaintexts)
 }
 
+func TestGCPConfigWriterUsesExistingStackKeyWhenPrimaryIsDisabled(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	keeper := newConfigTestKeeper(t)
+	_, wrappedStackKey, err := newWrappedDataKey(ctx, keeper)
+	require.NoError(t, err)
+	encodedStackKey := base64.StdEncoding.EncodeToString(wrappedStackKey)
+	ps := &workspace.ProjectStack{SecretsProvider: testGCPKMSURL, EncryptedKey: encodedStackKey}
+	enc, err := newGCPConfigEncrypter(ctx, ps, keeper)
+	require.NoError(t, err)
+
+	primaryDisabled := status.Error(codes.FailedPrecondition, "primary key version is disabled")
+	keeper.encryptErr = primaryDisabled
+	_, err = enc.EncryptValue(ctx, "no decryption permission")
+	require.ErrorIs(t, err, primaryDisabled)
+
+	keeper.allowDecrypt = true
+	ciphertext, err := enc.EncryptValue(ctx, "config value")
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(ciphertext, "v1:"))
+	assert.Equal(t, encodedStackKey, ps.EncryptedKey)
+	attempts := keeper.encrypts.Load()
+	_, err = enc.EncryptValue(ctx, "another config value")
+	require.NoError(t, err)
+	assert.Equal(t, attempts, keeper.encrypts.Load(), "reuse the unwrapped legacy key")
+	assert.EqualValues(t, 2, keeper.decrypts.Load())
+
+	reader, err := newCloudSecretsManagerWithKeeper(ctx, testGCPKMSURL, wrappedStackKey, keeper)
+	require.NoError(t, err)
+	plaintext, err := reader.Decrypter().DecryptValue(ctx, ciphertext)
+	require.NoError(t, err)
+	assert.Equal(t, "config value", plaintext)
+}
+
 func TestGCPConfigBatchCancelsInFlightRequests(t *testing.T) {
 	t.Parallel()
 

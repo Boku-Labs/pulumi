@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
 	"time"
@@ -91,6 +92,21 @@ func SaveProjectStack(
 		return stack.SaveRemoteConfig(ctx, ps)
 	}
 	return pkgWorkspace.SaveProjectStack(stack.Ref().Name().Q(), ps)
+}
+
+// SaveProjectStackWithEncrypter saves config before completing any pending log upgrade.
+func SaveProjectStackWithEncrypter(
+	ctx context.Context, stack backend.Stack, ps *workspace.ProjectStack, configFile string, encrypter config.Encrypter,
+) error {
+	if err := SaveProjectStack(ctx, stack, ps, configFile); err != nil {
+		return err
+	}
+	if pending, ok := encrypter.(deferredLogUpgradeEncrypter); ok {
+		if err := pending.upgrade(); err != nil {
+			slog.InfoContext(ctx, "encrypted log upgrade failed", "err", err)
+		}
+	}
+	return nil
 }
 
 type LoadOption int
@@ -547,7 +563,8 @@ func CopyEntireConfigMap(
 	currentProjectStack *workspace.ProjectStack,
 	destinationStack backend.Stack,
 	destinationProjectStack *workspace.ProjectStack,
-) (bool, error) {
+	configFile string,
+) error {
 	var decrypter config.Decrypter = config.NewPanicCrypter()
 	var encrypter config.Encrypter = config.NewPanicCrypter()
 	currentConfig := currentProjectStack.Config
@@ -556,7 +573,7 @@ func CopyEntireConfigMap(
 	if currentConfig.HasSecureValue() {
 		dec, state, decerr := ssml.GetDecrypter(ctx, currentStack, currentProjectStack)
 		if decerr != nil {
-			return false, decerr
+			return decerr
 		}
 		contract.Assertf(
 			state == SecretsManagerUnchanged,
@@ -566,7 +583,7 @@ func CopyEntireConfigMap(
 
 		enc, _, err := ssml.GetEncrypter(ctx, destinationStack, destinationProjectStack)
 		if err != nil {
-			return false, err
+			return err
 		}
 		encrypter = enc
 	}
@@ -576,14 +593,14 @@ func CopyEntireConfigMap(
 		secrets.EncrypterWithContext{Context: ctx, Encrypter: encrypter},
 	)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	var requiresSaving bool
 	for key, val := range newProjectConfig {
 		err = destinationProjectStack.Config.Set(key, val, false)
 		if err != nil {
-			return false, err
+			return err
 		}
 		requiresSaving = true
 	}
@@ -593,7 +610,10 @@ func CopyEntireConfigMap(
 		requiresSaving = true
 	}
 
-	return requiresSaving, nil
+	if !requiresSaving {
+		return nil
+	}
+	return SaveProjectStackWithEncrypter(ctx, destinationStack, destinationProjectStack, configFile, encrypter)
 }
 
 func SaveSnapshot(ctx context.Context, s backend.Stack, snapshot *deploy.Snapshot, force bool) error {
