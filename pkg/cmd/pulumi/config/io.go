@@ -40,9 +40,6 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/spf13/cobra"
-	"gocloud.dev/gcerrors"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"gopkg.in/yaml.v3"
 )
 
@@ -481,13 +478,7 @@ func (e *configCopyEncrypter) BatchEncrypt(ctx context.Context, plaintexts []str
 
 // diagnoseConfigValueError adds a property path when a nested failure can be reproduced.
 func diagnoseConfigValueError(ctx context.Context, value config.Value, batchErr error, retry func() error) error {
-	if !value.Object() || !value.Secure() || ctx.Err() != nil ||
-		errors.Is(batchErr, context.Canceled) || errors.Is(batchErr, context.DeadlineExceeded) ||
-		errors.Is(batchErr, gcerrors.ErrCanceled) || errors.Is(batchErr, gcerrors.ErrDeadlineExceeded) {
-		return batchErr
-	}
-	code := status.Code(batchErr)
-	if code == codes.Canceled || code == codes.DeadlineExceeded {
+	if !value.Object() || !value.Secure() || ctx.Err() != nil || secrets.IsCancellationError(batchErr) {
 		return batchErr
 	}
 

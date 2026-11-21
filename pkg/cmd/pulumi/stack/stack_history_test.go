@@ -17,14 +17,19 @@ package stack
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/display"
+	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/stretchr/testify/require"
+	"gocloud.dev/gcerrors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestBuildUpdatesJSONWithFailedDecryptedSecureObject(t *testing.T) {
@@ -85,6 +90,31 @@ func TestBuildUpdatesJSONBatchesSecretsAndCancels(t *testing.T) {
 	}
 	_, err = buildUpdatesJSON(ctx, updates, decrypter)
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestBuildUpdatesJSONDoesNotRetryProviderCancellation(t *testing.T) {
+	t.Parallel()
+
+	updates := []backend.UpdateInfo{{Config: config.Map{
+		config.MustMakeKey("test", "first"):  config.NewSecureValue("first"),
+		config.MustMakeKey("test", "second"): config.NewSecureValue("second"),
+	}}}
+	for _, cause := range []error{gcerrors.ErrCanceled, status.Error(codes.DeadlineExceeded, "KMS deadline expired")} {
+		providerErr := fmt.Errorf("decrypting configuration: %w", cause)
+		retries := 0
+		decrypter := historyBatchDecrypter{
+			Decrypter: &secrets.MockDecrypter{DecryptValueF: func(value string) string {
+				retries++
+				return value
+			}},
+			batch: func(context.Context, []string) ([]string, error) {
+				return nil, providerErr
+			},
+		}
+		_, err := buildUpdatesJSON(t.Context(), updates, decrypter)
+		require.ErrorIs(t, err, providerErr)
+		require.Zero(t, retries)
+	}
 }
 
 type historyBatchDecrypter struct {

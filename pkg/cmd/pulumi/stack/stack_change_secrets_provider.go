@@ -163,12 +163,16 @@ func (cmd *stackChangeSecretsProviderCmd) Run(ctx context.Context, args []string
 		return err
 	}
 
-	upgradeStackLogger(ctx, currentStack, newManager)
-
 	fmt.Fprintf(stdout, "Migrating old configuration and state to new secrets provider\n")
-	return migrateOldConfigAndCheckpointToNewSecretsProvider(
+	if err := migrateOldConfigAndCheckpointToNewSecretsProvider(
 		ctx, cmd.secretsProvider, currentStack, &newConfig, decrypter, newManager,
-	)
+	); err != nil {
+		return err
+	}
+
+	// Upgrade the diagnostics only after the new key can be recovered.
+	upgradeStackLogger(ctx, currentStack, newManager)
+	return nil
 }
 
 func migrateOldConfigAndCheckpointToNewSecretsProvider(

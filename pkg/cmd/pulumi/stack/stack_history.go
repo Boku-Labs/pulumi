@@ -236,8 +236,14 @@ func decryptHistoryConfig(
 	}
 	contextual := secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter}
 	values, err := secure.Decrypt(contextual)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if secrets.IsCancellationError(err) {
+		return nil, err
+	}
 	if err == nil {
-		return values, ctx.Err()
+		return values, nil
 	}
 
 	// Preserve readable history values even if some keys in a batch cannot be decrypted.
@@ -246,7 +252,11 @@ func decryptHistoryConfig(
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if value, err := item.Value(contextual); err == nil {
+		value, err := item.Value(contextual)
+		if secrets.IsCancellationError(err) {
+			return nil, err
+		}
+		if err == nil {
 			values[key] = value
 		}
 	}

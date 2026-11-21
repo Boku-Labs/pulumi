@@ -17,7 +17,6 @@ package engine
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -484,7 +483,7 @@ func configSecretsForRedaction(ctx context.Context, cfg config.Map, decrypter co
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if secrets.IsCancellationError(err) {
 			return nil, err
 		}
 		// The batch error may not identify an item. Retry by key to report a
@@ -497,6 +496,9 @@ func configSecretsForRedaction(ctx context.Context, cfg config.Map, decrypter co
 			_, itemErr := value.SecureValues(contextual)
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
+			}
+			if secrets.IsCancellationError(itemErr) {
+				return nil, itemErr
 			}
 			if itemErr != nil {
 				return nil, DecryptError{Key: key, Err: itemErr}

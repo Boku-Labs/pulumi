@@ -16,8 +16,10 @@ package stack
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"testing"
@@ -105,8 +107,12 @@ func TestChangeSecretsProvider_NoSecrets(t *testing.T) {
 	}
 
 	var mockStack *backend.MockStack
+	var exportErr error
 	mockBackend := &backend.MockBackend{
 		ExportDeploymentF: func(ctx context.Context, _ backend.Stack) (*apitype.UntypedDeployment, error) {
+			if exportErr != nil {
+				return nil, exportErr
+			}
 			return stack.SerializeUntypedDeployment(ctx, snapshot, &stack.SerializeOptions{
 				Pretty: true,
 			})
@@ -204,6 +210,36 @@ runtime: mock
 	projectStack, err := workspace.LoadProjectStack(nil /*sink*/, project, "Pulumi.testStack.yaml")
 	require.NoError(t, err)
 	assert.NotEmpty(t, projectStack.EncryptionSalt)
+
+	// A failed rotation must leave the persisted key and readable diagnostics behind.
+	originalConfig, err := os.ReadFile("Pulumi.testStack.yaml")
+	require.NoError(t, err)
+	originalSnapshot := snapshot
+	exportErr = errors.New("checkpoint export failed")
+	log, err = pkgLogging.StartLogging(t.Context(), nil, "failed stack change-secrets-provider")
+	require.NoError(t, err)
+	_, err = log.Write([]byte(diagnostic))
+	require.NoError(t, err)
+	mockStdin(t, "new-password\nnew-password\n")
+	require.ErrorIs(t, cmd.Run(t.Context(), []string{"passphrase"}), exportErr)
+	unchangedConfig, err := os.ReadFile("Pulumi.testStack.yaml")
+	require.NoError(t, err)
+	assert.Equal(t, originalConfig, unchangedConfig)
+	assert.Same(t, originalSnapshot, snapshot)
+
+	logPath = log.FilePath()
+	closeErr = log.Close()
+	log = nil
+	require.NoError(t, closeErr)
+	failedLog, err := os.Open(logPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, failedLog.Close()) })
+	gzipReader, err := gzip.NewReader(failedLog)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, gzipReader.Close()) })
+	failedRecords, err := io.ReadAll(gzipReader)
+	require.NoError(t, err)
+	assert.Contains(t, string(failedRecords), diagnostic)
 }
 
 // Test that we can change the secrets provider for a stack, this sets up a mock stack using a mock secret provider and

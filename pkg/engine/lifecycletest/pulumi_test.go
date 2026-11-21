@@ -34,6 +34,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gocloud.dev/gcerrors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -634,6 +635,37 @@ func TestConfigSecretRedactionBatchesAndCancels(t *testing.T) {
 			require.Len(t, batches, 1)
 			assert.ElementsMatch(t, []string{"encrypted first", "encrypted second"}, batches[0])
 		})
+	}
+}
+
+func TestConfigSecretRedactionDoesNotRetryProviderCancellation(t *testing.T) {
+	t.Parallel()
+
+	for _, cause := range []error{status.Error(codes.Canceled, "KMS canceled the request"), gcerrors.ErrDeadlineExceeded} {
+		providerErr := fmt.Errorf("decrypting configuration: %w", cause)
+		calls := 0
+		p := &lt.TestPlan{
+			Options: lt.TestUpdateOptions{T: t, SkipDisplayTests: true},
+			Config: config.Map{
+				config.MustMakeKey("test", "first"):  config.NewSecureValue("encrypted first"),
+				config.MustMakeKey("test", "second"): config.NewSecureValue("encrypted second"),
+			},
+			Decrypter: configBatchDecrypter{
+				Decrypter: config.NewPanicCrypter(),
+				batch: func(_ context.Context, ciphertexts []string) ([]string, error) {
+					calls++
+					if calls == 1 {
+						return nil, providerErr
+					}
+					return ciphertexts, nil
+				},
+			},
+		}
+		_, err := lt.TestOp(Update).RunWithContext(
+			t.Context(), p.GetProject(), p.GetTarget(t, nil), p.Options, true /*dryRun*/, nil, nil,
+		)
+		require.ErrorIs(t, err, providerErr)
+		require.Equal(t, 1, calls)
 	}
 }
 

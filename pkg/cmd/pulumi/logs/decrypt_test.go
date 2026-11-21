@@ -210,6 +210,15 @@ func TestDecryptAndShareLogWithConfigKey(t *testing.T) {
 			}
 		})
 	}
+	badConfig := workspace.ProjectStack{
+		SecretsProvider: provider,
+		EncryptedKey:    base64.StdEncoding.EncodeToString(key[:len(key)-1]),
+	}
+	require.NoError(t, badConfig.Save("invalid.yaml"))
+	invalidConfig := newDecryptCmd(&pkgWorkspace.MockContext{})
+	invalidConfig.SetArgs([]string{name, "--config-file", "invalid.yaml"})
+	require.ErrorContains(t, invalidConfig.ExecuteContext(t.Context()), "invalid stack data key length")
+
 	saved, err := os.ReadFile("Pulumi.dev.yaml")
 	require.NoError(t, err)
 	assert.Equal(t, configBefore, saved)

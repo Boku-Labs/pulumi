@@ -119,6 +119,10 @@ func newCloudSecretsManagerWithKeeper(
 	if err != nil {
 		return nil, err
 	}
+	if len(plaintextDataKey) != config.SymmetricCrypterKeyBytes {
+		return nil, fmt.Errorf("invalid stack data key length: got %d bytes, want %d",
+			len(plaintextDataKey), config.SymmetricCrypterKeyBytes)
+	}
 	state, err := json.Marshal(cloudSecretsManagerState{
 		URL:          url,
 		EncryptedKey: encryptedDataKey,

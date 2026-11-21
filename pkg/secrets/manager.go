@@ -19,6 +19,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+
+	"gocloud.dev/gcerrors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 )
@@ -53,6 +58,16 @@ func AreCompatible(a, b Manager) bool {
 	as := a.State()
 	bs := b.State()
 	return bytes.Equal(as, bs)
+}
+
+// IsCancellationError reports whether a secrets operation was canceled or exceeded its deadline.
+func IsCancellationError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, gcerrors.ErrCanceled) || errors.Is(err, gcerrors.ErrDeadlineExceeded) {
+		return true
+	}
+	code := status.Code(err)
+	return code == codes.Canceled || code == codes.DeadlineExceeded
 }
 
 // EncrypterWithContext carries a command's context through config APIs that
