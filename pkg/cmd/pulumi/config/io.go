@@ -437,12 +437,14 @@ func copySingleConfigKey(
 		}
 	}
 
-	values, err := (config.Map{key: v}).Copy(
-		secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter},
-		secrets.EncrypterWithContext{Context: ctx, Encrypter: encrypter},
-	)
+	source := secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter}
+	destination := secrets.EncrypterWithContext{Context: ctx, Encrypter: encrypter}
+	values, err := (config.Map{key: v}).Copy(source, destination)
 	if err != nil {
-		return err
+		return diagnoseConfigValueError(ctx, v, err, func() error {
+			_, err := v.Copy(source, destination)
+			return err
+		})
 	}
 
 	err = destinationProjectStack.Config.Set(key, values[key], path)
@@ -451,6 +453,18 @@ func copySingleConfigKey(
 	}
 
 	return cmdStack.SaveProjectStack(ctx, destinationStack, destinationProjectStack, configFile)
+}
+
+// A batch failure has no property path. Retry a nested secret value through the
+// per-property API for diagnostics, keeping the batch error if the retry succeeds.
+func diagnoseConfigValueError(ctx context.Context, value config.Value, batchErr error, retry func() error) error {
+	if value.Object() && value.Secure() && ctx.Err() == nil &&
+		!errors.Is(batchErr, context.Canceled) && !errors.Is(batchErr, context.DeadlineExceeded) {
+		if err := retry(); err != nil {
+			return err
+		}
+	}
+	return batchErr
 }
 
 func parseKeyValuePair(pair string, path bool) (config.Key, string, error) {

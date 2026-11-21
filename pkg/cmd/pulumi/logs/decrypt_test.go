@@ -98,11 +98,21 @@ func TestDecryptAndShareLogWithConfigKey(t *testing.T) {
 		SecretsProvider: provider,
 		EncryptedKey:    base64.StdEncoding.EncodeToString(key),
 	}
-	const alternateConfig = "alternate.yaml"
 	require.NoError(t, stackConfig.Save("Pulumi.dev.yaml"))
-	require.NoError(t, stackConfig.Save(alternateConfig))
 	configBefore, err := os.ReadFile("Pulumi.dev.yaml")
 	require.NoError(t, err)
+
+	const alternateYAML = "alternate.yaml"
+	const alternateJSON = "alternate.json"
+	alternateConfig := map[string][]byte{
+		alternateYAML: []byte("\uFEFFsecretsprovider: " + provider +
+			"\nencryptedkey: " + stackConfig.EncryptedKey + "\nconfig: {region: europe-west1}\n"),
+		alternateJSON: []byte("\uFEFF{\"secretsprovider\":\"" + provider +
+			"\",\"encryptedkey\":\"" + stackConfig.EncryptedKey + "\",\"config\":{\"region\":\"europe-west1\"}}"),
+	}
+	for path, contents := range alternateConfig {
+		require.NoError(t, os.WriteFile(path, contents, 0o600))
+	}
 
 	ref := &backend.MockStackReference{NameV: tokens.MustParseStackName("dev")}
 	var checkpoint *apitype.UntypedDeployment
@@ -161,7 +171,8 @@ func TestDecryptAndShareLogWithConfigKey(t *testing.T) {
 	}{
 		{name: "no checkpoint"},
 		{name: "stale checkpoint", state: &apitype.UntypedDeployment{Version: 3, Deployment: stale}},
-		{name: "custom file without a project or checkpoint", configFile: alternateConfig},
+		{name: "custom YAML without a project or checkpoint", configFile: alternateYAML},
+		{name: "custom JSON without a project or checkpoint", configFile: alternateJSON},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			checkpoint = tc.state
@@ -193,6 +204,9 @@ func TestDecryptAndShareLogWithConfigKey(t *testing.T) {
 			assert.NotContains(t, string(shared), record)
 			if tc.configFile != "" {
 				assert.Equal(t, beforeReads, checkpointReads)
+				saved, err := os.ReadFile(tc.configFile)
+				require.NoError(t, err)
+				assert.Equal(t, alternateConfig[tc.configFile], saved)
 			}
 		})
 	}

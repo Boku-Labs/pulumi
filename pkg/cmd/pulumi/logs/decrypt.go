@@ -16,6 +16,7 @@ package logs
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -45,6 +46,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/secrets/cloud"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/encoding"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
@@ -138,11 +140,7 @@ func openStackLog(
 	ctx context.Context, ws pkgWorkspace.Context, stackName, configFile string, f *os.File,
 ) (*encryptedlog.Reader, error) {
 	if configFile != "" {
-		project, _, err := ws.ReadProject("")
-		if err != nil && !errors.Is(err, workspace.ErrProjectNotFound) {
-			return nil, err
-		}
-		ps, err := workspace.LoadProjectStack(cmdutil.Diag(), project, configFile)
+		ps, err := loadLogKeyConfig(configFile)
 		if err != nil {
 			return nil, fmt.Errorf("loading stack configuration %q: %w", configFile, err)
 		}
@@ -189,6 +187,28 @@ func openStackLog(
 		fmt.Errorf("checkpoint: %w", checkpointErr),
 		fmt.Errorf("stack configuration: %w", configErr),
 	))
+}
+
+func loadLogKeyConfig(path string) (*workspace.ProjectStack, error) {
+	ext := filepath.Ext(path)
+	marshaler, ok := encoding.Marshalers[ext]
+	if !ok {
+		return nil, fmt.Errorf("no marshaler found for file format %q", ext)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Ignore config entries, as shorthand keys require a project to resolve.
+	var key struct {
+		SecretsProvider string `json:"secretsprovider" yaml:"secretsprovider"`
+		EncryptedKey    string `json:"encryptedkey" yaml:"encryptedkey"`
+	}
+	if err := marshaler.Unmarshal(bytes.TrimPrefix(data, []byte("\uFEFF")), &key); err != nil {
+		return nil, err
+	}
+	return &workspace.ProjectStack{SecretsProvider: key.SecretsProvider, EncryptedKey: key.EncryptedKey}, nil
 }
 
 func openLogWithStackConfig(

@@ -1534,8 +1534,13 @@ func getConfig(
 		} else {
 			d = config.NewPanicCrypter()
 		}
-		values, err := (config.Map{key: v}).Decrypt(secrets.DecrypterWithContext{Context: ctx, Decrypter: d})
+		decrypter := secrets.DecrypterWithContext{Context: ctx, Decrypter: d}
+		values, err := (config.Map{key: v}).Decrypt(decrypter)
 		if err != nil {
+			err = diagnoseConfigValueError(ctx, v, err, func() error {
+				_, err := v.Value(decrypter)
+				return err
+			})
 			return fmt.Errorf("could not decrypt configuration value: %w", err)
 		}
 		raw := values[key]

@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -713,6 +714,30 @@ func TestGetAndCopyConfigBatchNestedSecrets(t *testing.T) {
 	ciphertexts, err := saved.Config[key].SecureValues(config.NopDecrypter)
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"wrapped:one", "wrapped:two"}, ciphertexts)
+
+	sourceConfig.Config[key] = config.NewSecureObjectValue(
+		`{"database":{"items":[{"secure":"b25l"},{"secure":"invalid!"}]}}`,
+	)
+	require.NoError(t, sourceConfig.Save(sourceFile))
+	invalidSource := mockStack("source", &secrets.MockSecretsManager{
+		DecrypterF: func() config.Decrypter { return config.Base64Crypter },
+	})
+
+	out.Reset()
+	err = getConfig(ctx, &out, cmdutil.Diag(), stack.SecretsManagerLoader{}, workspaceContext,
+		invalidSource, key, false, false, false, sourceFile)
+	assert.ErrorContains(t, err, "database.items[1]: illegal base64 data")
+	assert.Empty(t, out.String())
+
+	beforeCopy, err := os.ReadFile(destinationFile)
+	require.NoError(t, err)
+	err = copySingleConfigKey(ctx, stack.SecretsManagerLoader{}, key.String(), false,
+		invalidSource, sourceConfig, destinationStack, destination, destinationFile)
+	assert.ErrorContains(t, err, "database.items[1]: illegal base64 data")
+	assert.Equal(t, saved.Config, destination.Config)
+	afterCopy, err := os.ReadFile(destinationFile)
+	require.NoError(t, err)
+	assert.Equal(t, beforeCopy, afterCopy)
 }
 
 func TestOpenStackEnvDiags(t *testing.T) {
