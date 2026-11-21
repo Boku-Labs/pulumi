@@ -611,8 +611,10 @@ func TestConfigSecretRedactionBatchesAndCancels(t *testing.T) {
 			p := &lt.TestPlan{
 				Options: lt.TestUpdateOptions{T: t, SkipDisplayTests: true},
 				Config: config.Map{
-					config.MustMakeKey("test", "first"):  config.NewSecureValue("encrypted first"),
-					config.MustMakeKey("test", "second"): config.NewSecureValue("encrypted second"),
+					config.MustMakeKey("test", "first"): config.NewSecureValue("encrypted first"),
+					config.MustMakeKey("test", "nested"): config.NewSecureObjectValue(
+						`{"array":[{"secret":{"secure":"encrypted nested"}},"plaintext sibling"]}`,
+					),
 				},
 				Decrypter: configBatchDecrypter{
 					Decrypter: config.NewPanicCrypter(),
@@ -633,7 +635,7 @@ func TestConfigSecretRedactionBatchesAndCancels(t *testing.T) {
 			)
 			require.ErrorIs(t, err, context.Canceled)
 			require.Len(t, batches, 1)
-			assert.ElementsMatch(t, []string{"encrypted first", "encrypted second"}, batches[0])
+			assert.ElementsMatch(t, []string{"encrypted first", "encrypted nested"}, batches[0])
 		})
 	}
 }

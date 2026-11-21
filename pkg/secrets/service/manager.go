@@ -117,9 +117,11 @@ func (c *serviceCrypter) BatchDecrypt(ctx context.Context, secrets []string) ([]
 	}
 
 	decryptedSecrets := make([]string, len(secrets))
-	for i, ciphertext := range secrets {
-		decrypted, ok := decryptedList[ciphertext]
-		contract.Assertf(ok, "decrypted value not found in batch response")
+	for i, ciphertext := range secretsToDecrypt {
+		decrypted, ok := decryptedList[base64.StdEncoding.EncodeToString(ciphertext)]
+		if !ok {
+			return nil, fmt.Errorf("decrypted value missing from batch response at input index %d", i)
+		}
 		decryptedSecrets[i] = string(decrypted)
 	}
 
