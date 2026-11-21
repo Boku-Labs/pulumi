@@ -1396,6 +1396,10 @@ func (pc *Client) BatchEncrypt(ctx context.Context, stack StackIdentifier,
 		httpCallOptions{GzipCompress: true, RetryPolicy: retryAllMethods}); err != nil {
 		return nil, err
 	}
+	if len(resp.Ciphertexts) != len(plaintexts) {
+		return nil, fmt.Errorf("invalid batch encrypt response: expected %d ciphertexts, got %d",
+			len(plaintexts), len(resp.Ciphertexts))
+	}
 
 	return resp.Ciphertexts, nil
 }

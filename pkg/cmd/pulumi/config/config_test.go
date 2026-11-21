@@ -621,6 +621,42 @@ func TestConfigSetSecretWithEncryptOnlyKMS(t *testing.T) {
 	assert.Zero(t, keeper.decrypts)
 }
 
+func TestConfigSetSecretContinuesOnLocalLogUpgradeFailure(t *testing.T) {
+	const provider = "gcpkms://projects/example/locations/global/keyRings/test/cryptoKeys/config"
+	const wrappedStackKey = "d3JhcHBlZC1zdGFjay1rZXk="
+
+	dir := t.TempDir()
+	t.Setenv("PULUMI_HOME", dir)
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", "")
+	project := &workspace.Project{Name: "testProject"}
+	path := filepath.Join(dir, "Pulumi.testStack.yaml")
+	projectStack := &workspace.ProjectStack{SecretsProvider: provider, EncryptedKey: wrappedStackKey}
+	require.NoError(t, projectStack.Save(path))
+
+	log, err := logging.StartLogging(t.Context(), nil, "config set")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = log.Close() })
+	_, err = io.WriteString(log, "diagnostic")
+	require.NoError(t, err)
+	// Simulate a local failure reading the current log during the upgrade.
+	f, err := os.OpenFile(log.FilePath(), os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte("bad header"), 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	keeper := &encryptOnlyConfigKeeper{}
+	setSecret := newEncryptOnlyConfigSet(t, project, provider, path, "test value", keeper)
+	require.NoError(t, setSecret())
+
+	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), project, path)
+	require.NoError(t, err)
+	assert.Equal(t, wrappedStackKey, saved.EncryptedKey)
+	assert.True(t, saved.Config[config.MustMakeKey("testProject", "test")].Secure())
+	assert.Equal(t, 2, keeper.encrypts, "prepare the log key and encrypt the config value")
+	assert.Zero(t, keeper.decrypts)
+}
+
 func TestConfigSetSecretBootstrapLogStaysReadableOnFailure(t *testing.T) {
 	const provider = "gcpkms://projects/example/locations/global/keyRings/test/cryptoKeys/config"
 	const diagnostic = "first write diagnostic"

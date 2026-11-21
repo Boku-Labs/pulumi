@@ -2278,6 +2278,38 @@ func TestDownloadTemplateForeignURLInheritsInsecure(t *testing.T) {
 	})
 }
 
+func TestBatchEncryptValidatesResponseCount(t *testing.T) {
+	t.Parallel()
+
+	stackID := StackIdentifier{Owner: "owner", Project: "project", Stack: tokens.MustParseStackName("stack")}
+	plaintexts := [][]byte{[]byte("first"), []byte("second")}
+	for _, tc := range []struct {
+		name     string
+		response string
+		wantErr  string
+	}{
+		{name: "missing", response: `{}`, wantErr: "expected 2 ciphertexts, got 0"},
+		{name: "short", response: `{"ciphertexts":["YQ=="]}`, wantErr: "expected 2 ciphertexts, got 1"},
+		{name: "long", response: `{"ciphertexts":["YQ==","Yg==","Yw=="]}`, wantErr: "expected 2 ciphertexts, got 3"},
+		{name: "matching", response: `{"ciphertexts":["YQ==","Yg=="]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := newMockServer(http.StatusOK, tc.response)
+			t.Cleanup(server.Close)
+			ciphertexts, err := newMockClient(server).BatchEncrypt(t.Context(), stackID, plaintexts)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				assert.Nil(t, ciphertexts)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, [][]byte{[]byte("a"), []byte("b")}, ciphertexts)
+		})
+	}
+}
+
 func TestGetStackOutputs(t *testing.T) {
 	t.Parallel()
 

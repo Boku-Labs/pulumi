@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"sort"
 	"time"
@@ -102,9 +101,7 @@ func SaveProjectStackWithEncrypter(
 		return err
 	}
 	if pending, ok := encrypter.(deferredLogUpgradeEncrypter); ok {
-		if err := pending.upgrade(); err != nil {
-			slog.InfoContext(ctx, "encrypted log upgrade failed", "err", err)
-		}
+		finishConfigLogUpgrade(ctx, pending.upgrade)
 	}
 	return nil
 }

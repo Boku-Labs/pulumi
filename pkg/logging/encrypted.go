@@ -41,17 +41,7 @@ var currentLogger *Logger
 // UpgradeCurrentLogger upgrades the currently active logger to encrypted mode
 // and renames the log file to include the stack name and update ID.
 func UpgradeCurrentLogger(ctx context.Context, stackName, updateID string, sm secrets.Manager) error {
-	if currentLogger == nil || sm == nil {
-		return nil
-	}
-	return UpgradeCurrentLoggerWithEncrypter(ctx, stackName, updateID, sm.Encrypter())
-}
-
-// UpgradeCurrentLoggerWithEncrypter encrypts the current log with the supplied encrypter.
-func UpgradeCurrentLoggerWithEncrypter(
-	ctx context.Context, stackName, updateID string, encrypter config.Encrypter,
-) error {
-	return currentLogger.upgradeToEncrypted(ctx, stackName, updateID, encrypter)
+	return currentLogger.UpgradeToEncrypted(ctx, stackName, updateID, sm)
 }
 
 // PrepareCurrentLoggerUpgrade wraps a session key and returns the pending log upgrade.

@@ -220,17 +220,17 @@ func (l *SecretsManagerLoader) GetEncrypter(
 	}
 	if enc != nil {
 		fqn := string(s.Ref().FullyQualifiedName())
-		if oldConfig.EncryptedKey != ps.EncryptedKey {
-			// The old log format stays readable until the new wrapped key is saved.
-			upgrade, err := pkgLogging.PrepareCurrentLoggerUpgrade(ctx, fqn, "", enc)
-			if err != nil {
-				return nil, SecretsManagerUnchanged, fmt.Errorf("encrypting command diagnostics: %w", err)
-			}
-			if upgrade != nil {
-				enc = deferredLogUpgradeEncrypter{Encrypter: enc, upgrade: upgrade}
-			}
-		} else if err := pkgLogging.UpgradeCurrentLoggerWithEncrypter(ctx, fqn, "", enc); err != nil {
+		upgrade, err := pkgLogging.PrepareCurrentLoggerUpgrade(ctx, fqn, "", enc)
+		if err != nil {
 			return nil, SecretsManagerUnchanged, fmt.Errorf("encrypting command diagnostics: %w", err)
+		}
+		if upgrade != nil {
+			if oldConfig.EncryptedKey != ps.EncryptedKey {
+				// The old log format stays readable until the new wrapped key is saved.
+				enc = deferredLogUpgradeEncrypter{Encrypter: enc, upgrade: upgrade}
+			} else {
+				finishConfigLogUpgrade(ctx, upgrade)
+			}
 		}
 		if needsSaveProjectStackAfterSecretManger(&oldConfig, ps) {
 			return enc, SecretsManagerMustSave, nil
@@ -249,6 +249,12 @@ func (l *SecretsManagerLoader) GetEncrypter(
 type deferredLogUpgradeEncrypter struct {
 	config.Encrypter
 	upgrade func() error
+}
+
+func finishConfigLogUpgrade(ctx context.Context, upgrade func() error) {
+	if err := upgrade(); err != nil {
+		slog.InfoContext(ctx, "encrypted log upgrade failed", "err", err)
+	}
 }
 
 // Returns a secrets manager for the given stack and project stack.
