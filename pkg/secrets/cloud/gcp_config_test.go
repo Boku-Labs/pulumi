@@ -182,6 +182,69 @@ func TestGCPConfigWriterUsesExistingStackKeyWhenPrimaryIsDisabled(t *testing.T) 
 	assert.Equal(t, "config value", plaintext)
 }
 
+type legacyConfigBatchSpy struct {
+	batch func(context.Context, []string) ([]string, error)
+}
+
+func (d legacyConfigBatchSpy) DecryptValue(context.Context, string) (string, error) {
+	return "", errors.New("unexpected individual legacy decryption")
+}
+
+func (d legacyConfigBatchSpy) BatchDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
+	return d.batch(ctx, ciphertexts)
+}
+
+func TestGCPConfigBatchDecryptLegacy(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name         string
+		cancelBefore bool
+		cancelDuring bool
+		wantError    error
+		wantCalls    int
+	}{
+		{name: "success", wantCalls: 1},
+		{name: "already canceled", cancelBefore: true, wantError: context.Canceled},
+		{name: "canceled during batch", cancelDuring: true, wantError: context.Canceled, wantCalls: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.cancelBefore {
+				cancel()
+			}
+
+			ciphertexts := []string{"v1:ciphertext1", "v1:ciphertext2", "v1:ciphertext3"}
+			calls := 0
+			decrypter := gcpConfigDecrypter{
+				legacy: legacyConfigBatchSpy{
+					batch: func(batchCtx context.Context, batch []string) ([]string, error) {
+						calls++
+						assert.Same(t, ctx, batchCtx)
+						assert.Equal(t, []string{"v1:ciphertext1", "v1:ciphertext2", "v1:ciphertext3"}, batch)
+						if tt.cancelDuring {
+							cancel()
+						}
+						return []string{"first", "", "third"}, nil
+					},
+				},
+			}
+			plaintexts, err := decrypter.BatchDecrypt(ctx, ciphertexts)
+			assert.Equal(t, tt.wantCalls, calls)
+			if tt.wantError != nil {
+				require.ErrorIs(t, err, tt.wantError)
+				assert.Nil(t, plaintexts)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, []string{"first", "", "third"}, plaintexts)
+		})
+	}
+}
+
 func TestGCPConfigBatchCancelsInFlightRequests(t *testing.T) {
 	t.Parallel()
 

@@ -238,7 +238,28 @@ func (d gcpConfigDecrypter) DecryptValue(ctx context.Context, ciphertext string)
 }
 
 func (d gcpConfigDecrypter) BatchDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
-	return transformConfigBatch(ctx, ciphertexts, d.DecryptValue)
+	if len(ciphertexts) == 0 {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for _, ciphertext := range ciphertexts {
+		if strings.HasPrefix(ciphertext, gcpConfigCiphertextPrefix) {
+			return transformConfigBatch(ctx, ciphertexts, d.DecryptValue)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	plaintexts, err := d.legacy.BatchDecrypt(ctx, ciphertexts)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return plaintexts, nil
 }
 
 // transformConfigBatch limits concurrent KMS requests and preserves input order.
