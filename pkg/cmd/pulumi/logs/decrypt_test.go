@@ -210,6 +210,30 @@ func TestDecryptAndShareLogWithConfigKey(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("absent remote config and checkpoint", func(t *testing.T) {
+		checkpoint = nil
+		remoteReads := 0
+		stack.ConfigLocationF = func() backend.StackConfigLocation {
+			return backend.StackConfigLocation{IsRemote: true}
+		}
+		stack.LoadRemoteF = func(context.Context, *workspace.Project) (*workspace.ProjectStack, error) {
+			remoteReads++
+			return nil, nil
+		}
+
+		var out bytes.Buffer
+		cmd := newDecryptCmd(ws)
+		cmd.SilenceUsage = true
+		cmd.SetOut(&out)
+		cmd.SetArgs([]string{name})
+		err := cmd.ExecuteContext(t.Context())
+		require.ErrorContains(t, err, "checkpoint: stack has no deployment")
+		require.ErrorContains(t, err, "stack configuration: stack configuration has no wrapped cloud secrets key")
+		assert.Equal(t, 1, remoteReads)
+		assert.Empty(t, out.String())
+	})
+
 	badConfig := workspace.ProjectStack{
 		SecretsProvider: provider,
 		EncryptedKey:    base64.StdEncoding.EncodeToString(key[:len(key)-1]),

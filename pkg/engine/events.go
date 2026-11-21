@@ -514,8 +514,9 @@ func configSecretsForRedaction(ctx context.Context, cfg config.Map, decrypter co
 	if secureKeys == 1 {
 		return nil, DecryptError{Key: secureKey, Err: err}
 	}
-	// Retry by key to turn a batch failure into a keyed diagnostic.
+	// Retry by key to recover from a batch failure or identify the failing key.
 	contextual := secrets.DecrypterWithContext{Context: ctx, Decrypter: redactionDecrypter{decrypter}}
+	var recovered []string
 	for key, value := range cfg {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -523,7 +524,7 @@ func configSecretsForRedaction(ctx context.Context, cfg config.Map, decrypter co
 		if !value.Secure() {
 			continue
 		}
-		_, itemErr := value.SecureValues(contextual)
+		values, itemErr := value.SecureValues(contextual)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
@@ -533,8 +534,12 @@ func configSecretsForRedaction(ctx context.Context, cfg config.Map, decrypter co
 		if itemErr != nil {
 			return nil, DecryptError{Key: key, Err: itemErr}
 		}
+		recovered = append(recovered, values...)
 	}
-	return nil, fmt.Errorf("failed to decrypt configuration secrets: %w", err)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return recovered, nil
 }
 
 func batchDecryptConfigSecrets(

@@ -640,6 +640,51 @@ func TestConfigSecretRedactionBatchesAndCancels(t *testing.T) {
 	}
 }
 
+func TestConfigSecretRedactionRecoversFromBatchFailure(t *testing.T) {
+	t.Parallel()
+
+	first := config.MustMakeKey("test", "first")
+	second := config.MustMakeKey("test", "second")
+	programF := deploytest.NewLanguageRuntimeF(func(info plugin.RunInfo, _ *deploytest.ResourceMonitor) error {
+		assert.Equal(t, map[config.Key]string{
+			first: "redaction retry plaintext first", second: "redaction retry plaintext second",
+		}, info.Config)
+		return nil
+	})
+	var batches [][]string
+	p := &lt.TestPlan{
+		Options: lt.TestUpdateOptions{
+			T: t, SkipDisplayTests: true, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil),
+		},
+		Config: config.Map{
+			first:  config.NewSecureValue("encrypted first"),
+			second: config.NewSecureValue("encrypted second"),
+		},
+		Decrypter: configBatchDecrypter{
+			Decrypter: config.NewPanicCrypter(),
+			batch: func(_ context.Context, ciphertexts []string) ([]string, error) {
+				batches = append(batches, ciphertexts)
+				if len(batches) == 1 {
+					return nil, errors.New("redaction batch failed")
+				}
+				plaintexts := make([]string, len(ciphertexts))
+				for i, ciphertext := range ciphertexts {
+					plaintexts[i] = "redaction retry plaintext " + strings.TrimPrefix(ciphertext, "encrypted ")
+				}
+				return plaintexts, nil
+			},
+		},
+	}
+	_, err := lt.TestOp(Update).RunWithContext(
+		t.Context(), p.GetProject(), p.GetTarget(t, nil), p.Options, true /*dryRun*/, nil, nil,
+	)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(batches), 4)
+	assert.ElementsMatch(t, []string{"encrypted first", "encrypted second"}, batches[0])
+	assert.ElementsMatch(t, [][]string{{"encrypted first"}, {"encrypted second"}}, batches[1:3])
+	assert.ElementsMatch(t, []string{"encrypted first", "encrypted second"}, batches[3])
+}
+
 func TestConfigSecretRedactionDoesNotRetryProviderCancellation(t *testing.T) {
 	t.Parallel()
 

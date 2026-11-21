@@ -77,7 +77,7 @@ func openKeeper(ctx context.Context, url string) (*gosecrets.Keeper, error) {
 
 // OpenCloudSecretsManager opens the key recorded in stack configuration without changing it.
 func OpenCloudSecretsManager(ctx context.Context, ps *workspace.ProjectStack) (secrets.Manager, error) {
-	if ps.SecretsProvider == "" || ps.EncryptedKey == "" {
+	if ps == nil || ps.SecretsProvider == "" || ps.EncryptedKey == "" {
 		return nil, errors.New("stack configuration has no wrapped cloud secrets key")
 	}
 	key, err := base64.StdEncoding.DecodeString(ps.EncryptedKey)

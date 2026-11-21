@@ -16,6 +16,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
@@ -140,6 +141,81 @@ func TestConfigSecretsForRedaction(t *testing.T) {
 		assert.Equal(t, key, decryptErr.Key)
 		assert.Nil(t, plaintexts)
 	})
+}
+
+func TestConfigSecretsForRedactionRetriesByKey(t *testing.T) {
+	t.Parallel()
+
+	scalar := config.MustMakeKey("test", "scalar")
+	nested := config.MustMakeKey("test", "nested")
+	cfg := config.Map{
+		scalar: config.NewSecureValue("scalar"),
+		nested: config.NewSecureObjectValue(
+			`{"array":[{"secure":"nested"},"plain",{"secure":"nested"},{"secure":""}]}`,
+		),
+		config.MustMakeKey("test", "plain"): config.NewValue("plaintext config"),
+	}
+	for _, test := range []struct {
+		name        string
+		failRetry   bool
+		cancelRetry bool
+	}{
+		{name: "recover"},
+		{name: "invalid response on second retry", failRetry: true},
+		{name: "cancellation on second retry", cancelRetry: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var batches [][]string
+			decrypter := eventTestDecrypter{
+				Decrypter: config.NewPanicCrypter(),
+				batch: func(batchCtx context.Context, ciphertexts []string) ([]string, error) {
+					assert.Equal(t, ctx, batchCtx)
+					batches = append(batches, ciphertexts)
+					if len(batches) == 1 {
+						assert.ElementsMatch(t, []string{"scalar", "nested", "nested", ""}, ciphertexts)
+						return []string{"discarded aggregate value"}, errors.New("aggregate decryption failed")
+					}
+					if len(batches) == 3 {
+						if test.failRetry {
+							return nil, nil
+						}
+						if test.cancelRetry {
+							cancel()
+						}
+					}
+					if len(ciphertexts) == 1 {
+						return []string{"scalar secret"}, nil
+					}
+					return []string{"nested secret", "nested secret", ""}, nil
+				},
+			}
+			plaintexts, err := configSecretsForRedaction(ctx, cfg, decrypter)
+			require.Len(t, batches, 3)
+			require.ElementsMatch(t, [][]string{{"scalar"}, {"nested", "nested", ""}}, batches[1:])
+			switch {
+			case test.failRetry:
+				var decryptErr DecryptError
+				require.ErrorAs(t, err, &decryptErr)
+				keys := map[string]config.Key{"scalar": scalar, "nested": nested}
+				assert.Equal(t, keys[batches[2][0]], decryptErr.Key)
+				assert.ErrorContains(t, decryptErr.Err, "config decryption batch returned 0 plaintexts, expected")
+				assert.Nil(t, plaintexts)
+			case test.cancelRetry:
+				require.ErrorIs(t, err, context.Canceled)
+				assert.Nil(t, plaintexts)
+			default:
+				require.NoError(t, err)
+				assert.Contains(t, [][]string{
+					{"scalar secret", "nested secret", "nested secret", ""},
+					{"nested secret", "nested secret", "", "scalar secret"},
+				}, plaintexts)
+			}
+		})
+	}
 }
 
 func TestBatchDecryptConfigSecrets(t *testing.T) {
