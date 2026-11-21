@@ -40,6 +40,9 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/spf13/cobra"
+	"gocloud.dev/gcerrors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"gopkg.in/yaml.v3"
 )
 
@@ -437,12 +440,22 @@ func copySingleConfigKey(
 		}
 	}
 
-	source := secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter}
-	destination := secrets.EncrypterWithContext{Context: ctx, Encrypter: encrypter}
+	var source config.Decrypter = secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter}
+	if v.Object() && v.Secure() {
+		// Reuse the decrypted values when diagnosing a destination failure.
+		source = config.NewCiphertextToPlaintextCachedCrypter(config.NewPanicCrypter(), source)
+	}
+	destination := &configCopyEncrypter{
+		Encrypter: secrets.EncrypterWithContext{Context: ctx, Encrypter: encrypter},
+	}
 	values, err := (config.Map{key: v}).Copy(source, destination)
 	if err != nil {
 		return diagnoseConfigValueError(ctx, v, err, func() error {
-			_, err := v.Copy(source, destination)
+			if destination.batchFailed {
+				_, err := v.Copy(source, destination)
+				return err
+			}
+			_, err := v.Value(source)
 			return err
 		})
 	}
@@ -455,16 +468,37 @@ func copySingleConfigKey(
 	return cmdStack.SaveProjectStack(ctx, destinationStack, destinationProjectStack, configFile)
 }
 
-// A batch failure has no property path. Retry a nested secret value through the
-// per-property API for diagnostics, keeping the batch error if the retry succeeds.
+type configCopyEncrypter struct {
+	config.Encrypter
+	batchFailed bool
+}
+
+func (e *configCopyEncrypter) BatchEncrypt(ctx context.Context, plaintexts []string) ([]string, error) {
+	values, err := e.Encrypter.BatchEncrypt(ctx, plaintexts)
+	e.batchFailed = err != nil
+	return values, err
+}
+
+// diagnoseConfigValueError adds a property path when a nested failure can be reproduced.
 func diagnoseConfigValueError(ctx context.Context, value config.Value, batchErr error, retry func() error) error {
-	if value.Object() && value.Secure() && ctx.Err() == nil &&
-		!errors.Is(batchErr, context.Canceled) && !errors.Is(batchErr, context.DeadlineExceeded) {
-		if err := retry(); err != nil {
-			return err
-		}
+	if !value.Object() || !value.Secure() || ctx.Err() != nil ||
+		errors.Is(batchErr, context.Canceled) || errors.Is(batchErr, context.DeadlineExceeded) ||
+		errors.Is(batchErr, gcerrors.ErrCanceled) || errors.Is(batchErr, gcerrors.ErrDeadlineExceeded) {
+		return batchErr
 	}
-	return batchErr
+	code := status.Code(batchErr)
+	if code == codes.Canceled || code == codes.DeadlineExceeded {
+		return batchErr
+	}
+
+	retryErr := retry()
+	if retryErr == nil {
+		return batchErr
+	}
+	if errors.Is(retryErr, batchErr) {
+		return retryErr
+	}
+	return fmt.Errorf("%w (batch operation failed: %w)", retryErr, batchErr)
 }
 
 func parseKeyValuePair(pair string, path bool) (config.Key, string, error) {
