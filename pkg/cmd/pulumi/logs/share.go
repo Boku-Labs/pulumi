@@ -28,12 +28,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/pkg/v3/backend/httpstate"
 	"github.com/pulumi/pulumi/pkg/v3/backend/httpstate/client"
-	cmdBackend "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/backend"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/constrictor"
-	cmdStack "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/stack"
 	"github.com/pulumi/pulumi/pkg/v3/engine/encryptedlog"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
@@ -48,6 +45,7 @@ func newShareCmd(
 ) *cobra.Command {
 	var includeSecrets bool
 	var latest bool
+	var configFile string
 
 	cmd := &cobra.Command{
 		Use:   "share",
@@ -113,7 +111,7 @@ func newShareCmd(
 			}
 
 			if string(magic[:]) == encryptedlog.Magic {
-				err = sharePLOG(ctx, ws, stackName, f, outPath, sessionID, sessionKey, redact)
+				err = sharePLOG(ctx, ws, stackName, configFile, f, outPath, sessionID, sessionKey, redact)
 			} else {
 				err = shareGzip(f, outPath, sessionID, sessionKey, redact)
 			}
@@ -133,6 +131,8 @@ func newShareCmd(
 		Required:  0,
 	})
 
+	cmd.Flags().StringVar(&configFile, "config-file", "",
+		"Use the cloud secrets key from this stack configuration file")
 	cmd.Flags().BoolVar(&latest, "latest", false,
 		"Share the most recent log file without prompting")
 	cmd.Flags().BoolVar(&includeSecrets, "include-secrets", false,
@@ -144,35 +144,12 @@ func newShareCmd(
 // sharePLOG decrypts a PLOG file, optionally redacts secrets, and
 // re-encrypts the content with the service-provided session key.
 func sharePLOG(
-	ctx context.Context, ws pkgWorkspace.Context, stackName string,
+	ctx context.Context, ws pkgWorkspace.Context, stackName, configFile string,
 	f *os.File, outPath string, sessionID string, sessionKey []byte, redact bool,
 ) error {
-	if stackName == "" {
-		stackName = stackNameFromFilename(filepath.Base(f.Name()))
-	}
-	if stackName == "" {
-		return fmt.Errorf("cannot determine stack from filename %q; use --stack to specify", filepath.Base(f.Name()))
-	}
-
-	opts := display.Options{Color: cmdutil.GetGlobalColorization()}
-	s, err := cmdStack.RequireStack(
-		ctx, cmdutil.Diag(), ws,
-		cmdBackend.DefaultLoginManager,
-		stackName, cmdStack.LoadOnly, opts, "",
-	)
+	reader, err := openStackLog(ctx, ws, stackName, configFile, f)
 	if err != nil {
-		return fmt.Errorf("loading stack %q: %w", stackName, err)
-	}
-
-	sm, err := secretsManagerFromStack(ctx, s)
-	if err != nil {
-		return fmt.Errorf("getting secrets manager for stack %q: %w", stackName, err)
-	}
-
-	// Decrypt the entire log body.
-	reader, err := encryptedlog.NewReader(ctx, f, sm.Decrypter())
-	if err != nil {
-		return fmt.Errorf("decrypting log: %w", err)
+		return err
 	}
 	plaintext, err := io.ReadAll(reader)
 	if err != nil {

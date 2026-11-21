@@ -115,11 +115,11 @@ func (c Value) SecureValues(decrypter Decrypter) ([]string, error) {
 		return nil, err
 	}
 
-	var ctChunks [][]string
-	obj.EncryptedValues(&ctChunks)
+	var ctChunks valueChunks
+	obj.collectEncryptedValues(&ctChunks)
 
 	var result []string
-	for _, ctChunk := range ctChunks {
+	for _, ctChunk := range ctChunks.chunks {
 		if len(ctChunk) == 0 {
 			continue
 		}

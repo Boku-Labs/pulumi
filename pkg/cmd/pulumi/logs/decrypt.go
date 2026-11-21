@@ -16,6 +16,7 @@ package logs
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -42,8 +43,10 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/ui"
 	"github.com/pulumi/pulumi/pkg/v3/engine/encryptedlog"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	"github.com/pulumi/pulumi/pkg/v3/secrets/cloud"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/encoding"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
@@ -52,6 +55,7 @@ import (
 
 func newDecryptCmd(ws pkgWorkspace.Context) *cobra.Command {
 	var latest bool
+	var configFile string
 	command := &cobra.Command{
 		Use:   "decrypt [filename]",
 		Short: "Decrypt and display automatic logs",
@@ -106,7 +110,11 @@ func newDecryptCmd(ws pkgWorkspace.Context) *cobra.Command {
 			defer out.Flush()
 
 			if string(magic[:]) == encryptedlog.Magic {
-				return decryptPLOG(cmd, ws, stackName, f, out)
+				reader, err := openStackLog(cmd.Context(), ws, stackName, configFile, f)
+				if err != nil {
+					return err
+				}
+				return formatLogRecords(reader, out, false)
 			}
 
 			gz, err := gzip.NewReader(f)
@@ -119,50 +127,112 @@ func newDecryptCmd(ws pkgWorkspace.Context) *cobra.Command {
 		},
 	}
 
+	command.Flags().StringVar(&configFile, "config-file", "",
+		"Use the cloud secrets key from this stack configuration file")
 	command.Flags().BoolVar(&latest, "latest", false,
 		"Decrypt the most recent log file without prompting")
 
 	return command
 }
 
-// decryptPLOG decrypts an encrypted PLOG log file. The stack name is
-// parsed from the filename, or overridden with --stack. The secrets
-// provider is read from the stack's deployment, so no project directory
-// is needed.
-func decryptPLOG(
-	cmd *cobra.Command, ws pkgWorkspace.Context,
-	stackName string, f *os.File, out io.Writer,
-) error {
-	ctx := cmd.Context()
+// openStackLog uses an explicit config file when supplied, otherwise it tries the checkpoint and stack YAML.
+func openStackLog(
+	ctx context.Context, ws pkgWorkspace.Context, stackName, configFile string, f *os.File,
+) (*encryptedlog.Reader, error) {
+	if configFile != "" {
+		ps, err := loadLogKeyConfig(configFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading stack configuration %q: %w", configFile, err)
+		}
+		reader, err := openLogWithConfigKey(ctx, f, ps)
+		if err != nil {
+			return nil, fmt.Errorf("decrypting log using stack configuration %q: %w", configFile, err)
+		}
+		return reader, nil
+	}
 
 	if stackName == "" {
 		stackName = stackNameFromFilename(filepath.Base(f.Name()))
 	}
 	if stackName == "" {
-		return fmt.Errorf("cannot determine stack from filename %q; use --stack to specify", filepath.Base(f.Name()))
+		return nil, fmt.Errorf("cannot determine stack from filename %q; use --stack to specify", filepath.Base(f.Name()))
 	}
 
 	opts := display.Options{Color: cmdutil.GetGlobalColorization()}
-	s, err := cmdStack.RequireStack(
-		ctx, cmdutil.Diag(), ws,
-		cmdBackend.DefaultLoginManager,
-		stackName, cmdStack.LoadOnly, opts, "",
-	)
+	s, err := cmdStack.RequireStack(ctx, cmdutil.Diag(), ws, cmdBackend.DefaultLoginManager, stackName, cmdStack.LoadOnly,
+		opts, "")
 	if err != nil {
-		return fmt.Errorf("loading stack %q for decryption: %w", stackName, err)
+		return nil, fmt.Errorf("loading stack %q for decryption: %w", stackName, err)
 	}
 
-	sm, err := secretsManagerFromStack(ctx, s)
+	sm, checkpointErr := secretsManagerFromStack(ctx, s)
+	if checkpointErr == nil {
+		reader, err := encryptedlog.NewReader(ctx, f, sm.Decrypter())
+		if err == nil {
+			return reader, nil
+		}
+		checkpointErr = err
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewinding log: %w", err)
+	}
+	reader, configErr := openLogWithStackConfig(ctx, ws, s, f)
+	if configErr == nil {
+		return reader, nil
+	}
+	return nil, fmt.Errorf("decrypting log for stack %q: %w", stackName, errors.Join(
+		fmt.Errorf("checkpoint: %w", checkpointErr),
+		fmt.Errorf("stack configuration: %w", configErr),
+	))
+}
+
+func loadLogKeyConfig(path string) (*workspace.ProjectStack, error) {
+	ext := filepath.Ext(path)
+	marshaler, ok := encoding.Marshalers[ext]
+	if !ok {
+		return nil, fmt.Errorf("no marshaler found for file format %q", ext)
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("getting secrets manager for stack %q: %w", stackName, err)
+		return nil, err
 	}
 
-	reader, err := encryptedlog.NewReader(ctx, f, sm.Decrypter())
-	if err != nil {
-		return fmt.Errorf("decrypting log: %w", err)
+	// Ignore config entries, as shorthand keys require a project to resolve.
+	var key struct {
+		SecretsProvider string `json:"secretsprovider" yaml:"secretsprovider"`
+		EncryptedKey    string `json:"encryptedkey" yaml:"encryptedkey"`
 	}
+	if err := marshaler.Unmarshal(bytes.TrimPrefix(data, []byte("\uFEFF")), &key); err != nil {
+		return nil, err
+	}
+	return &workspace.ProjectStack{SecretsProvider: key.SecretsProvider, EncryptedKey: key.EncryptedKey}, nil
+}
 
-	return formatLogRecords(reader, out, false)
+func openLogWithStackConfig(
+	ctx context.Context, ws pkgWorkspace.Context, s backend.Stack, f *os.File,
+) (*encryptedlog.Reader, error) {
+	project, _, err := ws.ReadProject("")
+	if err != nil {
+		return nil, err
+	}
+	ps, err := cmdStack.LoadProjectStack(ctx, cmdutil.Diag(), project, s, "")
+	if err != nil {
+		return nil, err
+	}
+	return openLogWithConfigKey(ctx, f, ps)
+}
+
+func openLogWithConfigKey(
+	ctx context.Context, f *os.File, ps *workspace.ProjectStack,
+) (*encryptedlog.Reader, error) {
+	sm, err := cloud.OpenCloudSecretsManager(ctx, ps)
+	if err != nil {
+		return nil, err
+	}
+	return encryptedlog.NewReader(ctx, f, sm.Decrypter())
 }
 
 // stackNameFromFilename extracts the stack name from a log filename.

@@ -15,10 +15,12 @@
 package workspace
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/pulumi/pulumi/sdk/v3/go/common/esc"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
@@ -29,7 +31,7 @@ func TestValidateStackConfigValues(t *testing.T) {
 		// If decrypter is nil, function should return immediately with no error.
 		project := &workspace.Project{Name: "testProject"}
 		stackCfg := config.Map{}
-		err := validateStackConfigValues("stackA", project, stackCfg, nil)
+		err := validateStackConfigValues(t.Context(), "stackA", project, stackCfg, nil)
 		require.NoError(t, err)
 	})
 
@@ -39,7 +41,7 @@ func TestValidateStackConfigValues(t *testing.T) {
 		project := &workspace.Project{Name: "testProject"}
 		stackCfg := config.Map{}
 
-		err := validateStackConfigValues("stackA", project, stackCfg, config.NopDecrypter)
+		err := validateStackConfigValues(t.Context(), "stackA", project, stackCfg, config.NopDecrypter)
 		require.NoError(t, err)
 	})
 
@@ -53,7 +55,7 @@ func TestValidateStackConfigValues(t *testing.T) {
 		wantErr := "decrypt failed"
 		dec := config.NewErrorCrypter(wantErr)
 
-		err := validateStackConfigValues("stackA", project, stackCfg, dec)
+		err := validateStackConfigValues(t.Context(), "stackA", project, stackCfg, dec)
 		require.Error(t, err) //nolint:forbidigo // pre-existing
 		require.Contains(t, err.Error(), wantErr)
 	})
@@ -88,7 +90,7 @@ func TestValidateStackConfigValues(t *testing.T) {
 			config.MustMakeKey("testProject", "testSecret"):  config.NewSecureValue("dGVzdFZhbHVl"),
 		}
 
-		err := validateStackConfigValues("stackA", project, stackCfg, config.Base64Crypter)
+		err := validateStackConfigValues(t.Context(), "stackA", project, stackCfg, config.Base64Crypter)
 		require.NoError(t, err)
 	})
 
@@ -133,4 +135,31 @@ func TestValidateStackConfigValues(t *testing.T) {
 		require.Error(t, err) //nolint:forbidigo // pre-existing
 		require.Contains(t, err.Error(), "must be of type")
 	})
+}
+
+func TestValidateStackConfigPropagatesCancellation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	cfg := config.Map{
+		config.MustMakeKey("project", "secret"): config.NewSecureValue("ciphertext"),
+	}
+	decrypter := validationCancellationDecrypter{
+		Decrypter: config.NopDecrypter,
+		cancel:    cancel,
+	}
+	err := ValidateStackConfigAndApplyProjectConfig(ctx, "stackA", &workspace.Project{Name: "project"},
+		esc.Value{}, cfg, config.NopEncrypter, decrypter)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+type validationCancellationDecrypter struct {
+	config.Decrypter
+	cancel context.CancelFunc
+}
+
+func (d validationCancellationDecrypter) BatchDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
+	d.cancel()
+	return ciphertexts, ctx.Err()
 }

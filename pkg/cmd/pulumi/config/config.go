@@ -281,28 +281,15 @@ func newConfigCopyCmd(
 				)
 			}
 
-			requiresSaving, err := cmdStack.CopyEntireConfigMap(
+			return cmdStack.CopyEntireConfigMap(
 				ctx,
 				ssml,
 				currentStack,
 				currentProjectStack,
 				destinationStack,
 				destinationProjectStack,
+				*configFile,
 			)
-			if err != nil {
-				return err
-			}
-
-			// The use of `requiresSaving` here ensures that there was actually some config
-			// that needed saved, otherwise it's an unnecessary save call
-			if requiresSaving {
-				err := cmdStack.SaveProjectStack(ctx, destinationStack, destinationProjectStack, *configFile)
-				if err != nil {
-					return err
-				}
-			}
-
-			return nil
 		},
 	}
 
@@ -751,13 +738,20 @@ type configSetCmd struct {
 	Type      string
 
 	OverrideImport bool
+
+	secretsManagerLoader *cmdStack.SecretsManagerLoader
 }
 
 func newConfigSetCmd(
 	ws pkgWorkspace.Context, stack *string, lm cmdBackend.LoginManager, configFile *string,
 ) *cobra.Command {
-	configSetCmd := &configSetCmd{LoadProjectStack: cmdStack.LoadProjectStack}
+	set := &configSetCmd{LoadProjectStack: cmdStack.LoadProjectStack}
+	return set.command(ws, stack, lm, configFile)
+}
 
+func (configSetCmd *configSetCmd) command(
+	ws pkgWorkspace.Context, stack *string, lm cmdBackend.LoginManager, configFile *string,
+) *cobra.Command {
 	setCmd := &cobra.Command{
 		Use:   "set",
 		Short: "Set configuration value",
@@ -900,8 +894,12 @@ func (c *configSetCmd) Run(
 		return err
 	}
 
-	ssml := cmdStack.NewStackSecretsManagerLoaderFromEnv()
-	w, err := newConfigWriter(s, project.Name, ps, configFile, &ssml, c.OverrideImport)
+	ssml := c.secretsManagerLoader
+	if ssml == nil {
+		loader := cmdStack.NewStackSecretsManagerLoaderFromEnv()
+		ssml = &loader
+	}
+	w, err := newConfigWriter(s, project.Name, ps, configFile, ssml, c.OverrideImport)
 	if err != nil {
 		return err
 	}
@@ -1061,106 +1059,35 @@ func newConfigSetAllCmd(
 				if err != nil {
 					return err
 				}
-				v := config.NewValue(value)
-
-				err = w.Set(ctx, key, v, path)
-				if err != nil {
+				if err := w.Set(ctx, key, config.NewValue(value), path); err != nil {
 					return err
 				}
 			}
-
-			// We only want to fetch the stack encrypter once, and then only if we actually have one or more secrets to
-			// encrypt. We thus set up a little helper function to encrypt a value, caching the crypter once we've initially
-			// loaded it.
-			var c config.Encrypter
-			encrypt := func(plaintext string) (string, error) {
-				var err error
-				if c == nil {
-					c, err = w.Encrypter(ctx)
-					if err != nil {
-						return "", err
-					}
-				}
-
-				enc, err := c.EncryptValue(ctx, plaintext)
+			var values []configSetAllValue
+			for _, secretArg := range secretArgs {
+				key, value, err := parseKeyValuePair(secretArg, path)
 				if err != nil {
-					return "", err
+					return err
 				}
-
-				return enc, nil
+				values = append(values, configSetAllValue{key: key, value: value, path: path, secret: true})
+			}
+			for jsonKey, jsonValue := range jsonConfig {
+				if jsonValue.Value == nil {
+					return fmt.Errorf("value for --json object key %q is nil", jsonKey)
+				}
+				key, err := ParseConfigKey(ws, jsonKey, false /*path*/)
+				if err != nil {
+					return fmt.Errorf("invalid --json object key %q: %w", jsonKey, err)
+				}
+				object := jsonValue.ObjectValue != nil
+				values = append(values, configSetAllValue{
+					key: key, value: *jsonValue.Value, path: object, object: object, secret: jsonValue.Secret, jsonKey: jsonKey,
+				})
 			}
 
-			for _, sArg := range secretArgs {
-				key, value, err := parseKeyValuePair(sArg, path)
-				if err != nil {
-					return err
-				}
-				if err := w.CheckSet(ctx, key, path); err != nil {
-					return err
-				}
-
-				enc, err := encrypt(value)
-				if err != nil {
-					return err
-				}
-				v := config.NewSecureValue(enc)
-
-				err = w.Set(ctx, key, v, path)
-				if err != nil {
-					return err
-				}
-			}
-
-			if jsonArg != "" {
-				for jsonKey, jsonValue := range jsonConfig {
-					// Every key in the JSON must have a value. While `pulumi config --json` may produce empty values for secrets
-					// where --show-secrets is not passed, we don't allow setting those same (missing) values back into
-					// configuration.
-					if jsonValue.Value == nil {
-						return fmt.Errorf("value for --json object key %q is nil", jsonKey)
-					}
-
-					key, err := ParseConfigKey(ws, jsonKey, false /*path*/)
-					if err != nil {
-						return fmt.Errorf("invalid --json object key %q: %w", jsonKey, err)
-					}
-
-					var value config.Value
-					path := jsonValue.ObjectValue != nil
-					if jsonValue.Secret {
-						if err := w.CheckSet(ctx, key, path); err != nil {
-							return jsonConfigSetError(jsonKey, err)
-						}
-					}
-					if jsonValue.ObjectValue != nil {
-						// If we have an ObjectValue, Value will be the stringified version of the object. We'll thus operate on
-						// ObjectValue directly.
-						if jsonValue.Secret {
-							enc, err := encrypt(*jsonValue.Value)
-							if err != nil {
-								return err
-							}
-
-							value = config.NewSecureObjectValue(enc)
-						} else {
-							value = config.NewObjectValue(*jsonValue.Value)
-						}
-					} else if jsonValue.Secret {
-						enc, err := encrypt(*jsonValue.Value)
-						if err != nil {
-							return err
-						}
-
-						value = config.NewSecureValue(enc)
-					} else {
-						value = config.NewValue(*jsonValue.Value)
-					}
-
-					err = w.Set(ctx, key, value, path)
-					if err != nil {
-						return jsonConfigSetError(jsonKey, err)
-					}
-				}
+			batch := stack.ConfigLocation().ManagedEnvironment == ""
+			if err := setAllConfigValues(ctx, w, values, batch); err != nil {
+				return err
 			}
 
 			return w.Save(ctx)
@@ -1193,6 +1120,86 @@ func newConfigSetAllCmd(
 	_ = setCmd.PersistentFlags().MarkHidden("override-import")
 
 	return setCmd
+}
+
+type configSetAllValue struct {
+	key     config.Key
+	value   string
+	path    bool
+	object  bool
+	secret  bool
+	jsonKey string
+}
+
+func (value configSetAllValue) configValue(text string) config.Value {
+	switch {
+	case value.object && value.secret:
+		return config.NewSecureObjectValue(text)
+	case value.object:
+		return config.NewObjectValue(text)
+	case value.secret:
+		return config.NewSecureValue(text)
+	default:
+		return config.NewValue(text)
+	}
+}
+
+func setAllConfigValues(ctx context.Context, w ConfigWriter, values []configSetAllValue, batch bool) error {
+	var encrypter config.Encrypter
+	var ciphertexts []string
+	if batch {
+		var plaintexts []string
+		for _, value := range values {
+			if value.secret {
+				plaintexts = append(plaintexts, value.value)
+			}
+		}
+		if len(plaintexts) > 0 {
+			enc, err := w.Encrypter(ctx)
+			if err != nil {
+				return err
+			}
+			ciphertexts, err = enc.BatchEncrypt(ctx, plaintexts)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, value := range values {
+		text := value.value
+		if value.secret {
+			if err := w.CheckSet(ctx, value.key, value.path); err != nil {
+				if value.jsonKey != "" {
+					return jsonConfigSetError(value.jsonKey, err)
+				}
+				return err
+			}
+			if batch {
+				text, ciphertexts = ciphertexts[0], ciphertexts[1:]
+			} else {
+				// Managed environments validate each write against preceding changes.
+				var err error
+				if encrypter == nil {
+					encrypter, err = w.Encrypter(ctx)
+					if err != nil {
+						return err
+					}
+				}
+				text, err = encrypter.EncryptValue(ctx, text)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		if err := w.Set(ctx, value.key, value.configValue(text), value.path); err != nil {
+			if value.jsonKey != "" {
+				return jsonConfigSetError(value.jsonKey, err)
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // configValueJSON is the shape of the --json output for a configuration value.  While we can add fields to this
@@ -1319,7 +1326,7 @@ func listConfig(
 	}
 	sort.Sort(keys)
 
-	decryptedCfg, err := cfg.Decrypt(decrypter)
+	decryptedCfg, err := cfg.Decrypt(secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter})
 	if err != nil {
 		return fmt.Errorf("could not decrypt configuration values: %w", err)
 	}
@@ -1514,10 +1521,16 @@ func getConfig(
 		} else {
 			d = config.NewPanicCrypter()
 		}
-		raw, err := v.Value(d)
+		decrypter := secrets.DecrypterWithContext{Context: ctx, Decrypter: d}
+		values, err := (config.Map{key: v}).Decrypt(decrypter)
 		if err != nil {
+			err = diagnoseConfigValueError(ctx, v, err, func() error {
+				_, err := v.Value(decrypter)
+				return err
+			})
 			return fmt.Errorf("could not decrypt configuration value: %w", err)
 		}
+		raw := values[key]
 
 		if jsonOut {
 			value := configValueJSON{

@@ -16,8 +16,11 @@ package stack
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"testing"
 
@@ -25,6 +28,8 @@ import (
 
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	cmdBackend "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/backend"
+	"github.com/pulumi/pulumi/pkg/v3/engine/encryptedlog"
+	pkgLogging "github.com/pulumi/pulumi/pkg/v3/logging"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
@@ -73,8 +78,6 @@ func mockStdin(t *testing.T, input string) {
 
 // Test that we can change the secrets provider for a stack, this sets up a mock stack using a mock secret provider and
 // then changes it to the passphrase provider, but without any existing secrets.
-//
-//nolint:paralleltest // mutates global state
 func TestChangeSecretsProvider_NoSecrets(t *testing.T) {
 	var stdoutBuff bytes.Buffer
 	secretsProvider := b64.Base64SecretsProvider.Add("passphrase", func(state json.RawMessage) (secrets.Manager, error) {
@@ -102,8 +105,12 @@ func TestChangeSecretsProvider_NoSecrets(t *testing.T) {
 	}
 
 	var mockStack *backend.MockStack
+	var exportErr error
 	mockBackend := &backend.MockBackend{
 		ExportDeploymentF: func(ctx context.Context, _ backend.Stack) (*apitype.UntypedDeployment, error) {
+			if exportErr != nil {
+				return nil, exportErr
+			}
 			return stack.SerializeUntypedDeployment(ctx, snapshot, &stack.SerializeOptions{
 				Pretty: true,
 			})
@@ -154,9 +161,20 @@ func TestChangeSecretsProvider_NoSecrets(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	t.Chdir(tmpDir)
+	t.Setenv("PULUMI_HOME", tmpDir)
+	log, err := pkgLogging.StartLogging(t.Context(), nil, "stack change-secrets-provider")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if log != nil {
+			require.NoError(t, log.Close())
+		}
+	})
+	const diagnostic = "rotation diagnostic"
+	_, err = log.Write([]byte(diagnostic))
+	require.NoError(t, err)
 
 	// Setup a dummy project in this directory
-	err := os.WriteFile("Pulumi.yaml", []byte(`
+	err = os.WriteFile("Pulumi.yaml", []byte(`
 name: testProject
 runtime: mock
 `), 0o600)
@@ -170,12 +188,56 @@ runtime: mock
 
 	// Check that the snapshot now has a passphrase secrets manager
 	assert.Equal(t, "passphrase", snapshot.SecretsManager.Type())
+
+	logPath := log.FilePath()
+	closeErr := log.Close()
+	log = nil
+	require.NoError(t, closeErr)
+	logFile, err := os.Open(logPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, logFile.Close()) })
+	reader, err := encryptedlog.NewReader(t.Context(), logFile, snapshot.SecretsManager.Decrypter())
+	require.NoError(t, err)
+	records, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	assert.Contains(t, string(records), diagnostic)
+
 	// Check the config has been updated with the salt
 	project, err := workspace.LoadProject("Pulumi.yaml")
 	require.NoError(t, err)
 	projectStack, err := workspace.LoadProjectStack(nil /*sink*/, project, "Pulumi.testStack.yaml")
 	require.NoError(t, err)
 	assert.NotEmpty(t, projectStack.EncryptionSalt)
+
+	// A failed rotation must leave the persisted key and readable diagnostics behind.
+	originalConfig, err := os.ReadFile("Pulumi.testStack.yaml")
+	require.NoError(t, err)
+	originalSnapshot := snapshot
+	exportErr = errors.New("checkpoint export failed")
+	log, err = pkgLogging.StartLogging(t.Context(), nil, "failed stack change-secrets-provider")
+	require.NoError(t, err)
+	_, err = log.Write([]byte(diagnostic))
+	require.NoError(t, err)
+	mockStdin(t, "new-password\nnew-password\n")
+	require.ErrorIs(t, cmd.Run(t.Context(), []string{"passphrase"}), exportErr)
+	unchangedConfig, err := os.ReadFile("Pulumi.testStack.yaml")
+	require.NoError(t, err)
+	assert.Equal(t, originalConfig, unchangedConfig)
+	assert.Same(t, originalSnapshot, snapshot)
+
+	logPath = log.FilePath()
+	closeErr = log.Close()
+	log = nil
+	require.NoError(t, closeErr)
+	failedLog, err := os.Open(logPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, failedLog.Close()) })
+	gzipReader, err := gzip.NewReader(failedLog)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, gzipReader.Close()) })
+	failedRecords, err := io.ReadAll(gzipReader)
+	require.NoError(t, err)
+	assert.Contains(t, string(failedRecords), diagnostic)
 }
 
 // Test that we can change the secrets provider for a stack, this sets up a mock stack using a mock secret provider and
@@ -200,6 +262,11 @@ func TestChangeSecretsProvider_WithSecrets(t *testing.T) {
 	// Ideally this would be injected but the cmd functions repeatedly access global state to get the current
 	// backend.
 	secretsManager := b64.NewBase64SecretsManager()
+	oldConfigManager := secrets.Manager(&secrets.MockSecretsManager{
+		DecrypterF: func() config.Decrypter {
+			return &secrets.MockDecrypter{}
+		},
+	})
 	snapshot := &deploy.Snapshot{
 		SecretsManager: secretsManager,
 		Resources: []*pkgresource.State{
@@ -249,7 +316,7 @@ func TestChangeSecretsProvider_WithSecrets(t *testing.T) {
 			return snapshot, nil
 		},
 		DefaultSecretManagerF: func(_ context.Context, _ *workspace.ProjectStack) (secrets.Manager, error) {
-			return secretsManager, nil
+			return oldConfigManager, nil
 		},
 	}
 
@@ -290,7 +357,20 @@ runtime: mock
 	err = cfg.Save("Pulumi.testStack.yaml")
 	require.NoError(t, err)
 
-	// passphrase will read from stdin for the new passphrase
+	original, err := os.ReadFile("Pulumi.testStack.yaml")
+	require.NoError(t, err)
+
+	// A failure reading an old secret must leave the original config and checkpoint intact.
+	mockStdin(t, "password123\npassword123\n")
+	require.ErrorContains(t, cmd.Run(ctx, []string{"passphrase"}), "mock value not provided")
+	afterFailure, err := os.ReadFile("Pulumi.testStack.yaml")
+	require.NoError(t, err)
+	assert.Equal(t, original, afterFailure)
+	assert.Equal(t, b64.Type, snapshot.SecretsManager.Type())
+
+	// Retry after the old decrypter is available again.
+	oldConfigManager = secretsManager
+	stdoutBuff.Reset()
 	mockStdin(t, "password123\npassword123\n")
 	err = cmd.Run(ctx, []string{"passphrase"})
 	require.NoError(t, err)
@@ -349,4 +429,53 @@ func TestChangeSecretsProvider_ManagedEnvironment(t *testing.T) {
 	written, err := os.ReadFile("Pulumi.dev.yaml")
 	require.NoError(t, err)
 	assert.Equal(t, stackFile, string(written))
+}
+
+//nolint:paralleltest // changes the working directory
+func TestChangeSecretsProviderBatchesCheckpointEncryption(t *testing.T) {
+	t.Chdir(t.TempDir())
+	require.NoError(t, os.WriteFile("Pulumi.yaml", []byte("name: testProject\nruntime: mock\n"), 0o600))
+
+	old := b64.NewBase64SecretsManager()
+	snapshot := &deploy.Snapshot{
+		SecretsManager: old,
+		Resources: []*pkgresource.State{{
+			URN:  resource.NewURN("testStack", "testProject", "", resource.RootStackType, "testStack"),
+			Type: resource.RootStackType,
+			Outputs: resource.PropertyMap{
+				"first":  resource.MakeSecret(resource.NewProperty("first secret")),
+				"second": resource.MakeSecret(resource.NewProperty("second secret")),
+			},
+		}},
+	}
+	b := &backend.MockBackend{
+		ExportDeploymentF: func(ctx context.Context, _ backend.Stack) (*apitype.UntypedDeployment, error) {
+			return stack.SerializeUntypedDeployment(ctx, snapshot, nil)
+		},
+		ImportDeploymentF: func(context.Context, backend.Stack, *apitype.UntypedDeployment) error { return nil },
+	}
+	current := &backend.MockStack{
+		BackendF: func() backend.Backend { return b },
+		RefF: func() backend.StackReference {
+			return &backend.MockStackReference{NameV: tokens.MustParseStackName("testStack")}
+		},
+		ConfigLocationF: func() backend.StackConfigLocation { return backend.StackConfigLocation{} },
+	}
+
+	batches := 0
+	newManager := &secrets.MockSecretsManager{
+		TypeF:  old.Type,
+		StateF: old.State,
+		EncrypterF: func() config.Encrypter {
+			return &secrets.MockEncrypter{BatchEncryptF: func(values []string) []string {
+				batches++
+				assert.ElementsMatch(t, []string{`"first secret"`, `"second secret"`}, values)
+				return []string{"ciphertext1", "ciphertext2"}
+			}}
+		},
+	}
+	require.NoError(t, migrateOldConfigAndCheckpointToNewSecretsProvider(
+		t.Context(), b64.Base64SecretsProvider, current, &workspace.ProjectStack{}, old.Decrypter(), newManager,
+	))
+	require.Equal(t, 1, batches)
 }
