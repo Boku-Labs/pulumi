@@ -16,6 +16,8 @@ package engine
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"time"
 
 	pkgresource "github.com/pulumi/pulumi/pkg/v3/resource"
@@ -24,6 +26,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/display"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
+	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
@@ -450,27 +453,14 @@ type StepEventStateMetadata struct {
 	HideDiffs []resource.PropertyPath
 }
 
-func makeEventEmitter(events chan<- Event, update UpdateInfo) (eventEmitter, error) {
-	target := update.Target
-	var secrets []string
-	if target != nil && target.Config.HasSecureValue() {
-		for k, v := range target.Config {
-			if !v.Secure() {
-				continue
-			}
-
-			secureValues, err := v.SecureValues(target.Decrypter)
-			if err != nil {
-				return eventEmitter{}, DecryptError{
-					Key: k,
-					Err: err,
-				}
-			}
-			secrets = append(secrets, secureValues...)
+func makeEventEmitter(ctx context.Context, events chan<- Event, update UpdateInfo) (eventEmitter, error) {
+	if target := update.Target; target != nil && target.Config.HasSecureValue() {
+		secrets, err := configSecretsForRedaction(ctx, target.Config, target.Decrypter)
+		if err != nil {
+			return eventEmitter{}, err
 		}
+		logging.AddGlobalSecretFilter(secrets, "[secret]")
 	}
-
-	logging.AddGlobalSecretFilter(secrets, "[secret]")
 
 	buffer, done := make(chan Event), make(chan bool)
 	go queueEvents(events, buffer, done)
@@ -479,6 +469,127 @@ func makeEventEmitter(events chan<- Event, update UpdateInfo) (eventEmitter, err
 		done: done,
 		ch:   buffer,
 	}, nil
+}
+
+const configSecretBatchByteLimit = 100 * 1024 * 1024 // Matches the SDK config batch limit.
+
+func configSecretsForRedaction(ctx context.Context, cfg config.Map, decrypter config.Decrypter) ([]string, error) {
+	var ciphertexts []string
+	var secureKey config.Key
+	secureKeys := 0
+	for key, value := range cfg {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !value.Secure() {
+			continue
+		}
+		secureKey = key
+		secureKeys++
+		var err error
+		if value.Object() {
+			var values []string
+			values, err = value.SecureValues(config.NopDecrypter)
+			ciphertexts = append(ciphertexts, values...)
+		} else {
+			var ciphertext string
+			ciphertext, err = value.Value(config.NopDecrypter)
+			ciphertexts = append(ciphertexts, ciphertext)
+		}
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, DecryptError{Key: key, Err: err}
+		}
+	}
+
+	plaintexts, err := batchDecryptConfigSecrets(ctx, decrypter, ciphertexts, configSecretBatchByteLimit)
+	if err == nil {
+		return plaintexts, nil
+	}
+	if secrets.IsCancellationError(err) {
+		return nil, err
+	}
+	if secureKeys == 1 {
+		return nil, DecryptError{Key: secureKey, Err: err}
+	}
+	// Retry by key to recover from a batch failure or identify the failing key.
+	contextual := secrets.DecrypterWithContext{Context: ctx, Decrypter: redactionDecrypter{decrypter}}
+	var recovered []string
+	for key, value := range cfg {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if !value.Secure() {
+			continue
+		}
+		values, itemErr := value.SecureValues(contextual)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if secrets.IsCancellationError(itemErr) {
+			return nil, itemErr
+		}
+		if itemErr != nil {
+			return nil, DecryptError{Key: key, Err: itemErr}
+		}
+		recovered = append(recovered, values...)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return recovered, nil
+}
+
+func batchDecryptConfigSecrets(
+	ctx context.Context, decrypter config.Decrypter, ciphertexts []string, byteLimit int,
+) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(ciphertexts) == 0 {
+		return nil, nil
+	}
+	batchDecrypter := redactionDecrypter{decrypter}
+	plaintexts := make([]string, 0, len(ciphertexts))
+	for len(ciphertexts) > 0 {
+		end, remaining := 1, byteLimit-len(ciphertexts[0])
+		for end < len(ciphertexts) && len(ciphertexts[end]) <= remaining {
+			remaining -= len(ciphertexts[end])
+			end++
+		}
+		plaintextBatch, err := batchDecrypter.BatchDecrypt(ctx, ciphertexts[:end])
+		if err != nil {
+			return nil, err
+		}
+		plaintexts = append(plaintexts, plaintextBatch...)
+		ciphertexts = ciphertexts[end:]
+	}
+	return plaintexts, nil
+}
+
+// redactionDecrypter checks cancellation and response lengths for each batch, including per-key retries.
+type redactionDecrypter struct {
+	config.Decrypter
+}
+
+func (d redactionDecrypter) BatchDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	plaintexts, err := d.Decrypter.BatchDecrypt(ctx, ciphertexts)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(plaintexts) != len(ciphertexts) {
+		return nil, fmt.Errorf("config decryption batch returned %d plaintexts, expected %d",
+			len(plaintexts), len(ciphertexts))
+	}
+	return plaintexts, nil
 }
 
 func makeQueryEventEmitter(events chan<- Event) (eventEmitter, error) {

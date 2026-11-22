@@ -40,6 +40,10 @@ func (d DecryptError) Error() string {
 	return fmt.Sprintf("failed to decrypt configuration key '%s': %s", d.Key, d.Err)
 }
 
+func (d DecryptError) Unwrap() error {
+	return d.Err
+}
+
 // Returns a tuple in which the second element is true if and only if any error
 // in the given error's tree is a DecryptError. In that case, the first element
 // will be the first DecryptError in the tree. In the event that there is no such

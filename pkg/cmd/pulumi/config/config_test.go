@@ -842,11 +842,16 @@ func TestConfigSetAll(t *testing.T) {
 				},
 			}
 
-			// Create mock encrypter factory
+			batches := 0
 			mockEncrypterFactory := &mockEncrypterFactory{
 				encrypter: &secrets.MockEncrypter{
-					EncryptValueF: func(plaintext string) string {
-						return base64.StdEncoding.EncodeToString([]byte(plaintext))
+					BatchEncryptF: func(plaintexts []string) []string {
+						batches++
+						ciphertexts := make([]string, len(plaintexts))
+						for i, plaintext := range plaintexts {
+							ciphertexts[i] = base64.StdEncoding.EncodeToString([]byte(plaintext))
+						}
+						return ciphertexts
 					},
 				},
 			}
@@ -875,6 +880,13 @@ func TestConfigSetAll(t *testing.T) {
 
 			// Execute the command
 			err := cmd.RunE(cmd, []string{})
+			if c.expectError == "" {
+				wantBatches := 0
+				if len(c.secretArgs) > 0 || strings.Contains(c.jsonArg, `"secret": true`) {
+					wantBatches = 1
+				}
+				assert.Equal(t, wantBatches, batches)
+			}
 
 			// Check for expected error
 			if c.expectError != "" {

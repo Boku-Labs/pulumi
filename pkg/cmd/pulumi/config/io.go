@@ -406,7 +406,8 @@ func copySingleConfigKey(
 	destinationProjectStack *workspace.ProjectStack,
 	configFile string,
 ) error {
-	var decrypter config.Decrypter
+	var decrypter config.Decrypter = config.NewPanicCrypter()
+	var encrypter config.Encrypter = config.NewPanicCrypter()
 	key, err := ParseConfigKey(pkgWorkspace.Instance, configKey, path)
 	if err != nil {
 		return fmt.Errorf("invalid configuration key: %w", err)
@@ -429,26 +430,66 @@ func copySingleConfigKey(
 			state == cmdStack.SecretsManagerUnchanged,
 			"We're reading a secure value so the encryption information must be present already",
 		)
-	} else {
-		decrypter = config.NewPanicCrypter()
+
+		encrypter, _, err = ssml.GetEncrypter(ctx, destinationStack, destinationProjectStack)
+		if err != nil {
+			return err
+		}
 	}
 
-	encrypter, _, cerr := ssml.GetEncrypter(ctx, destinationStack, destinationProjectStack)
-	if cerr != nil {
-		return cerr
+	var source config.Decrypter = secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter}
+	if v.Object() && v.Secure() {
+		// Reuse the decrypted values when diagnosing a destination failure.
+		source = config.NewCiphertextToPlaintextCachedCrypter(config.NewPanicCrypter(), source)
 	}
-
-	val, err := v.Copy(decrypter, encrypter)
+	destination := &configCopyEncrypter{
+		Encrypter: secrets.EncrypterWithContext{Context: ctx, Encrypter: encrypter},
+	}
+	values, err := (config.Map{key: v}).Copy(source, destination)
 	if err != nil {
-		return err
+		return diagnoseConfigValueError(ctx, v, err, func() error {
+			if destination.batchFailed {
+				_, err := v.Copy(source, destination)
+				return err
+			}
+			_, err := v.Value(source)
+			return err
+		})
 	}
 
-	err = destinationProjectStack.Config.Set(key, val, path)
+	err = destinationProjectStack.Config.Set(key, values[key], path)
 	if err != nil {
 		return err
 	}
 
 	return cmdStack.SaveProjectStack(ctx, destinationStack, destinationProjectStack, configFile)
+}
+
+type configCopyEncrypter struct {
+	config.Encrypter
+	batchFailed bool
+}
+
+func (e *configCopyEncrypter) BatchEncrypt(ctx context.Context, plaintexts []string) ([]string, error) {
+	values, err := e.Encrypter.BatchEncrypt(ctx, plaintexts)
+	e.batchFailed = err != nil
+	return values, err
+}
+
+// diagnoseConfigValueError adds a property path when a nested failure can be reproduced.
+func diagnoseConfigValueError(ctx context.Context, value config.Value, batchErr error, retry func() error) error {
+	if !value.Object() || !value.Secure() || ctx.Err() != nil || secrets.IsCancellationError(batchErr) {
+		return batchErr
+	}
+
+	retryErr := retry()
+	if retryErr == nil {
+		return batchErr
+	}
+	if errors.Is(retryErr, batchErr) {
+		return retryErr
+	}
+	return fmt.Errorf("%w (batch operation failed: %w)", retryErr, batchErr)
 }
 
 func parseKeyValuePair(pair string, path bool) (config.Key, string, error) {

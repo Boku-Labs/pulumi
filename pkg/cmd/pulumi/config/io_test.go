@@ -15,13 +15,20 @@
 package config
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gocloud.dev/gcerrors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"gopkg.in/yaml.v3"
 
 	"github.com/pulumi/pulumi/pkg/v3/backend"
@@ -583,23 +590,259 @@ func TestCopyConfig(t *testing.T) {
 		err := yaml.Unmarshal([]byte("environment:\n  - test2"), &destinationProjectStack)
 		require.NoError(t, err)
 
-		requiresSaving, err := stack.CopyEntireConfigMap(
+		configPath := filepath.Join(t.TempDir(), "Pulumi.mystack2.yaml")
+		err = stack.CopyEntireConfigMap(
 			t.Context(),
 			stack.SecretsManagerLoader{},
 			sourceStack,
 			&sourceProjectStack,
 			destinationStack,
 			&destinationProjectStack,
+			configPath,
 		)
 		require.NoError(t, err)
-		assert.True(t, requiresSaving, "expected config file changes requiring saving")
+		saved, err := workspace.LoadProjectStack(
+			cmdutil.Diag(), &workspace.Project{Name: "project"}, configPath)
+		require.NoError(t, err)
 
 		// Assert that only the source stack's environment
 		// remains in the destination stack.
-		envImports := destinationProjectStack.Environment.Imports()
+		envImports := saved.Environment.Imports()
 		assert.Contains(t, envImports, "test")
 		assert.NotContains(t, envImports, "test2")
 	})
+}
+
+func TestCopyPlaintextConfigDoesNotLoadKMS(t *testing.T) {
+	t.Parallel()
+
+	key := config.MustMakeKey("project", "name")
+	source := &workspace.ProjectStack{Config: config.Map{key: config.NewValue("plaintext")}}
+	loader := stack.SecretsManagerLoader{}
+	destination := func() *workspace.ProjectStack {
+		return &workspace.ProjectStack{
+			SecretsProvider: "gcpkms://projects/example/locations/global/keyRings/test/cryptoKeys/test",
+			Config:          make(config.Map),
+		}
+	}
+
+	bulk := destination()
+	bulkPath := filepath.Join(t.TempDir(), "Pulumi.dev.yaml")
+	err := stack.CopyEntireConfigMap(t.Context(), loader, nil, source, nil, bulk, bulkPath)
+	require.NoError(t, err)
+	assert.Equal(t, source.Config, bulk.Config)
+	assert.Empty(t, bulk.EncryptedKey)
+
+	single := destination()
+	path := filepath.Join(t.TempDir(), "Pulumi.dev.yaml")
+	err = copySingleConfigKey(t.Context(), loader, key.String(), false, nil, source, nil, single, path)
+	require.NoError(t, err)
+	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), &workspace.Project{Name: "project"}, path)
+	require.NoError(t, err)
+	assert.Equal(t, source.Config, saved.Config)
+	assert.Empty(t, saved.EncryptedKey)
+}
+
+func TestGetAndCopyConfigBatchNestedSecrets(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	key := config.MustMakeKey("project", "object")
+	project := &workspace.Project{Name: "project"}
+	workspaceContext := &pkgWorkspace.MockContext{
+		ReadProjectF: func(string) (*workspace.Project, string, error) { return project, "", nil },
+	}
+	sourceConfig := &workspace.ProjectStack{Config: config.Map{
+		key: config.NewSecureObjectValue(`{"first":{"secure":"one"},"items":[{"secure":"two"}]}`),
+	}}
+	sourceFile := filepath.Join(t.TempDir(), "source.yaml")
+	require.NoError(t, sourceConfig.Save(sourceFile))
+
+	decryptBatches, encryptBatches := 0, 0
+	sourceManager := &secrets.MockSecretsManager{
+		DecrypterF: func() config.Decrypter {
+			return &secrets.MockDecrypter{BatchDecryptF: func(ciphertexts []string) []string {
+				decryptBatches++
+				assert.ElementsMatch(t, []string{"one", "two"}, ciphertexts)
+				return ciphertexts
+			}}
+		},
+	}
+	destinationManager := &secrets.MockSecretsManager{
+		EncrypterF: func() config.Encrypter {
+			return &secrets.MockEncrypter{BatchEncryptF: func(plaintexts []string) []string {
+				encryptBatches++
+				assert.ElementsMatch(t, []string{"one", "two"}, plaintexts)
+				values := make([]string, len(plaintexts))
+				for i, value := range plaintexts {
+					values[i] = "wrapped:" + value
+				}
+				return values
+			}}
+		},
+	}
+	sourceStack := mockConfigSecretsStack("source", sourceManager)
+	destinationStack := mockConfigSecretsStack("destination", destinationManager)
+
+	var out bytes.Buffer
+	require.NoError(t, getConfig(ctx, &out, cmdutil.Diag(), stack.SecretsManagerLoader{}, workspaceContext,
+		sourceStack, key, false, false, false, sourceFile))
+	assert.JSONEq(t, `{"first":"one","items":["two"]}`, out.String())
+	require.Equal(t, 1, decryptBatches)
+
+	destination := &workspace.ProjectStack{Config: make(config.Map)}
+	destinationFile := filepath.Join(t.TempDir(), "destination.yaml")
+	require.NoError(t, copySingleConfigKey(ctx, stack.SecretsManagerLoader{}, key.String(), false,
+		sourceStack, sourceConfig, destinationStack, destination, destinationFile))
+	require.Equal(t, 2, decryptBatches)
+	require.Equal(t, 1, encryptBatches)
+
+	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), project, destinationFile)
+	require.NoError(t, err)
+	assert.True(t, saved.Config[key].Secure())
+	ciphertexts, err := saved.Config[key].SecureValues(config.NopDecrypter)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"wrapped:one", "wrapped:two"}, ciphertexts)
+
+	sourceConfig.Config[key] = config.NewSecureObjectValue(
+		`{"database":{"items":[{"secure":"b25l"},{"secure":"invalid!"}]}}`,
+	)
+	require.NoError(t, sourceConfig.Save(sourceFile))
+	invalidSource := mockConfigSecretsStack("source", &secrets.MockSecretsManager{
+		DecrypterF: func() config.Decrypter { return config.Base64Crypter },
+	})
+
+	out.Reset()
+	err = getConfig(ctx, &out, cmdutil.Diag(), stack.SecretsManagerLoader{}, workspaceContext,
+		invalidSource, key, false, false, false, sourceFile)
+	assert.ErrorContains(t, err, "database.items[1]: illegal base64 data")
+	assert.Empty(t, out.String())
+
+	beforeCopy, err := os.ReadFile(destinationFile)
+	require.NoError(t, err)
+	err = copySingleConfigKey(ctx, stack.SecretsManagerLoader{}, key.String(), false,
+		invalidSource, sourceConfig, destinationStack, destination, destinationFile)
+	assert.ErrorContains(t, err, "database.items[1]: illegal base64 data")
+	assert.Equal(t, saved.Config, destination.Config)
+	afterCopy, err := os.ReadFile(destinationFile)
+	require.NoError(t, err)
+	assert.Equal(t, beforeCopy, afterCopy)
+}
+
+func TestCopySingleConfigKeyDiagnosesOnlyFailedBatch(t *testing.T) {
+	t.Parallel()
+
+	t.Run("source decryption fails", func(t *testing.T) {
+		t.Parallel()
+
+		batchErr := errors.New("source batch failed")
+		destinationEncrypts := 0
+		err := copyConfigWithTestCrypters(t,
+			decrypterWithBatchError{Decrypter: config.NopDecrypter, err: batchErr},
+			&secrets.MockEncrypter{
+				EncryptValueF: func(plaintext string) string {
+					destinationEncrypts++
+					return plaintext
+				},
+			})
+		assert.ErrorIs(t, err, batchErr)
+		assert.Zero(t, destinationEncrypts)
+	})
+
+	t.Run("destination encryption fails", func(t *testing.T) {
+		t.Parallel()
+
+		batchErr := errors.New("destination batch failed")
+		sourceDecrypts := 0
+		err := copyConfigWithTestCrypters(t,
+			&secrets.MockDecrypter{
+				BatchDecryptF: func(ciphertexts []string) []string { return ciphertexts },
+				DecryptValueF: func(ciphertext string) string {
+					sourceDecrypts++
+					return ciphertext
+				},
+			},
+			encrypterWithBatchError{Encrypter: config.NewErrorCrypter("denied"), err: batchErr})
+		assert.ErrorIs(t, err, batchErr)
+		assert.ErrorContains(t, err, "items[0]: failed to encrypt: denied")
+		assert.Zero(t, sourceDecrypts)
+	})
+}
+
+func TestDiagnoseConfigValueErrorSkipsCancellation(t *testing.T) {
+	t.Parallel()
+
+	value := config.NewSecureObjectValue(`{"item":{"secure":"one"}}`)
+	for _, cause := range []error{
+		context.Canceled,
+		context.DeadlineExceeded,
+		gcerrors.ErrCanceled,
+		gcerrors.ErrDeadlineExceeded,
+		status.Error(codes.Canceled, "KMS canceled the request"),
+		status.Error(codes.DeadlineExceeded, "KMS deadline expired"),
+	} {
+		batchErr := fmt.Errorf("unwrapping config secret data key: %w", cause)
+		err := diagnoseConfigValueError(t.Context(), value, batchErr, func() error {
+			t.Errorf("unexpected diagnostic retry for %v", cause)
+			return nil
+		})
+		assert.Equal(t, batchErr, err)
+	}
+}
+
+func copyConfigWithTestCrypters(t *testing.T, decrypter config.Decrypter, encrypter config.Encrypter) error {
+	t.Helper()
+
+	source := mockConfigSecretsStack("source", &secrets.MockSecretsManager{
+		DecrypterF: func() config.Decrypter { return decrypter },
+	})
+	destination := mockConfigSecretsStack("destination", &secrets.MockSecretsManager{
+		EncrypterF: func() config.Encrypter { return encrypter },
+	})
+	key := config.MustMakeKey("project", "object")
+	sourceConfig := &workspace.ProjectStack{Config: config.Map{
+		key: config.NewSecureObjectValue(`{"items":[{"secure":"one"},{"secure":"two"}]}`),
+	}}
+	destinationConfig := &workspace.ProjectStack{Config: config.Map{}}
+	path := filepath.Join(t.TempDir(), "destination.yaml")
+	err := copySingleConfigKey(t.Context(), stack.SecretsManagerLoader{}, key.String(), false,
+		source, sourceConfig, destination, destinationConfig, path)
+	assert.Empty(t, destinationConfig.Config)
+	assert.NoFileExists(t, path)
+	return err
+}
+
+func mockConfigSecretsStack(name string, manager secrets.Manager) *backend.MockStack {
+	return &backend.MockStack{
+		RefF: func() backend.StackReference {
+			return &backend.MockStackReference{
+				NameV:               tokens.MustParseStackName(name),
+				FullyQualifiedNameV: tokens.QName("org/project/" + name),
+			}
+		},
+		ConfigLocationF: func() backend.StackConfigLocation { return backend.StackConfigLocation{} },
+		DefaultSecretManagerF: func(context.Context, *workspace.ProjectStack) (secrets.Manager, error) {
+			return manager, nil
+		},
+	}
+}
+
+type decrypterWithBatchError struct {
+	config.Decrypter
+	err error
+}
+
+func (d decrypterWithBatchError) BatchDecrypt(context.Context, []string) ([]string, error) {
+	return nil, d.err
+}
+
+type encrypterWithBatchError struct {
+	config.Encrypter
+	err error
+}
+
+func (e encrypterWithBatchError) BatchEncrypt(context.Context, []string) ([]string, error) {
+	return nil, e.err
 }
 
 func TestOpenStackEnvDiags(t *testing.T) {

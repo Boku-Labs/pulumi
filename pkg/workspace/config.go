@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/esc"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
@@ -64,6 +65,7 @@ func missingStackConfigurationKeysError(missingKeys []string, stackName string) 
 }
 
 func validateStackConfigValues(
+	ctx context.Context,
 	stackName string,
 	project *workspace.Project,
 	stackConfig config.Map,
@@ -71,6 +73,10 @@ func validateStackConfigValues(
 ) error {
 	if dec == nil {
 		return nil
+	}
+
+	if dec != config.NopDecrypter {
+		dec = secrets.DecrypterWithContext{Context: ctx, Decrypter: dec}
 	}
 
 	// Batch decrypt all stack config values once to warm the cache.
@@ -356,7 +362,7 @@ func mergeConfig(
 
 	// Validate stack level values against the config defined at the project level
 	if validate {
-		err := validateStackConfigValues(stackName, project, stackConfig, decrypter)
+		err := validateStackConfigValues(ctx, stackName, project, stackConfig, decrypter)
 		if err != nil {
 			return err
 		}

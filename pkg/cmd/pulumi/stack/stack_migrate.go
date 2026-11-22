@@ -503,9 +503,10 @@ func (cmd *stackMigrateCmd) Run(
 	if err != nil {
 		return fmt.Errorf("loading target secrets manager: %w", err)
 	}
-	newEncrypter := newSM.Encrypter()
-
-	newConfig, err := srcPS.Config.Copy(oldDecrypter, newEncrypter)
+	newConfig, err := srcPS.Config.Copy(
+		secrets.DecrypterWithContext{Context: ctx, Decrypter: oldDecrypter},
+		secrets.EncrypterWithContext{Context: ctx, Encrypter: newSM.Encrypter()},
+	)
 	if err != nil {
 		return fmt.Errorf("re-encrypting stack config: %w", err)
 	}

@@ -37,6 +37,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/ui"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
+	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
@@ -546,40 +547,44 @@ func CopyEntireConfigMap(
 	currentProjectStack *workspace.ProjectStack,
 	destinationStack backend.Stack,
 	destinationProjectStack *workspace.ProjectStack,
-) (bool, error) {
-	var decrypter config.Decrypter
+	configFile string,
+) error {
+	var decrypter config.Decrypter = config.NewPanicCrypter()
+	var encrypter config.Encrypter = config.NewPanicCrypter()
 	currentConfig := currentProjectStack.Config
 	currentEnvironments := currentProjectStack.Environment
 
 	if currentConfig.HasSecureValue() {
 		dec, state, decerr := ssml.GetDecrypter(ctx, currentStack, currentProjectStack)
 		if decerr != nil {
-			return false, decerr
+			return decerr
 		}
 		contract.Assertf(
 			state == SecretsManagerUnchanged,
 			"We're reading a secure value so the encryption information must be present already",
 		)
 		decrypter = dec
-	} else {
-		decrypter = config.NewPanicCrypter()
+
+		enc, _, err := ssml.GetEncrypter(ctx, destinationStack, destinationProjectStack)
+		if err != nil {
+			return err
+		}
+		encrypter = enc
 	}
 
-	encrypter, _, cerr := ssml.GetEncrypter(ctx, destinationStack, destinationProjectStack)
-	if cerr != nil {
-		return false, cerr
-	}
-
-	newProjectConfig, err := currentConfig.Copy(decrypter, encrypter)
+	newProjectConfig, err := currentConfig.Copy(
+		secrets.DecrypterWithContext{Context: ctx, Decrypter: decrypter},
+		secrets.EncrypterWithContext{Context: ctx, Encrypter: encrypter},
+	)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	var requiresSaving bool
 	for key, val := range newProjectConfig {
 		err = destinationProjectStack.Config.Set(key, val, false)
 		if err != nil {
-			return false, err
+			return err
 		}
 		requiresSaving = true
 	}
@@ -589,7 +594,10 @@ func CopyEntireConfigMap(
 		requiresSaving = true
 	}
 
-	return requiresSaving, nil
+	if !requiresSaving {
+		return nil
+	}
+	return SaveProjectStack(ctx, destinationStack, destinationProjectStack, configFile)
 }
 
 func SaveSnapshot(ctx context.Context, s backend.Stack, snapshot *deploy.Snapshot, force bool) error {

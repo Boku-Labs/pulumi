@@ -1304,8 +1304,8 @@ func TestStackMigrate_ReencryptsConfigSecret(t *testing.T) { //nolint: parallelt
 		"    secure: src:plaintext-secret\n"
 	require.NoError(t, os.WriteFile("Pulumi.dev.yaml", []byte(srcYAML), 0o600))
 
-	srcCrypter := prefixCrypter{prefix: "src"}
-	tgtCrypter := prefixCrypter{prefix: "tgt"}
+	srcCrypter := migrationContextCrypter{Crypter: prefixCrypter{prefix: "src"}, t: t}
+	tgtCrypter := migrationContextCrypter{Crypter: prefixCrypter{prefix: "tgt"}, t: t}
 
 	srcSM := &secrets.MockSecretsManager{
 		TypeF:      func() string { return "passphrase" },
@@ -1450,6 +1450,21 @@ func TestStackMigrate_ReencryptsConfigSecret(t *testing.T) { //nolint: parallelt
 	require.NoError(t, err)
 	assert.Equal(t, "service", v3.SecretsProviders.Type,
 		"target's secrets manager should drive the imported deployment")
+}
+
+type migrationContextCrypter struct {
+	config.Crypter
+	t *testing.T
+}
+
+func (c migrationContextCrypter) BatchDecrypt(ctx context.Context, values []string) ([]string, error) {
+	assert.True(c.t, ctx.Done() == c.t.Context().Done(), "decryption must retain the migration context")
+	return c.Crypter.BatchDecrypt(ctx, values)
+}
+
+func (c migrationContextCrypter) BatchEncrypt(ctx context.Context, values []string) ([]string, error) {
+	assert.True(c.t, ctx.Done() == c.t.Context().Done(), "encryption must retain the migration context")
+	return c.Crypter.BatchEncrypt(ctx, values)
 }
 
 // stackUnmarshal is a tiny helper to avoid importing pkg/v3/resource/stack just for one call.

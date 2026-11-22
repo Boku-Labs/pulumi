@@ -34,6 +34,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gocloud.dev/gcerrors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -531,15 +532,19 @@ func TestLanguageHostDiagnostics(t *testing.T) {
 }
 
 type brokenDecrypter struct {
-	ErrorMessage string
+	ErrorMessage     string
+	BrokenCiphertext string
 }
 
-func (b brokenDecrypter) DecryptValue(_ context.Context, _ string) (string, error) {
-	return "", errors.New(b.ErrorMessage)
+func (b brokenDecrypter) DecryptValue(_ context.Context, ciphertext string) (string, error) {
+	if ciphertext == b.BrokenCiphertext {
+		return "", errors.New(b.ErrorMessage)
+	}
+	return ciphertext, nil
 }
 
-func (b brokenDecrypter) BatchDecrypt(_ context.Context, _ []string) ([]string, error) {
-	return nil, errors.New(b.ErrorMessage)
+func (b brokenDecrypter) BatchDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
+	return config.DefaultBatchDecrypt(ctx, b, ciphertexts)
 }
 
 // Tests that the engine presents a reasonable error message when a decrypter fails to decrypt a config value.
@@ -559,10 +564,11 @@ func TestBrokenDecrypter(t *testing.T) {
 	key := config.MustMakeKey("foo", "bar")
 	msg := "decryption failed"
 	configMap := make(config.Map)
-	configMap[key] = config.NewSecureValue("hunter2")
+	configMap[key] = config.NewSecureValue("broken")
+	configMap[config.MustMakeKey("foo", "readable")] = config.NewSecureValue("readable")
 	p := &lt.TestPlan{
 		Options:   lt.TestUpdateOptions{T: t, HostF: hostF},
-		Decrypter: brokenDecrypter{ErrorMessage: msg},
+		Decrypter: brokenDecrypter{ErrorMessage: msg, BrokenCiphertext: "broken"},
 		Config:    configMap,
 		Steps: []lt.TestStep{{
 			Op:            Update,
@@ -581,6 +587,133 @@ func TestBrokenDecrypter(t *testing.T) {
 	}
 
 	p.Run(t, nil)
+}
+
+type configBatchDecrypter struct {
+	config.Decrypter
+	batch func(context.Context, []string) ([]string, error)
+}
+
+func (d configBatchDecrypter) BatchDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
+	return d.batch(ctx, ciphertexts)
+}
+
+func TestConfigSecretRedactionBatchesAndCancels(t *testing.T) {
+	t.Parallel()
+
+	for _, dryRun := range []bool{true, false} {
+		t.Run(fmt.Sprintf("preview=%t", dryRun), func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			var batches [][]string
+			p := &lt.TestPlan{
+				Options: lt.TestUpdateOptions{T: t, SkipDisplayTests: true},
+				Config: config.Map{
+					config.MustMakeKey("test", "first"): config.NewSecureValue("encrypted first"),
+					config.MustMakeKey("test", "nested"): config.NewSecureObjectValue(
+						`{"array":[{"secret":{"secure":"encrypted nested"}},"plaintext sibling"]}`,
+					),
+				},
+				Decrypter: configBatchDecrypter{
+					Decrypter: config.NewPanicCrypter(),
+					batch: func(ctx context.Context, ciphertexts []string) ([]string, error) {
+						batches = append(batches, ciphertexts)
+						cancel()
+						select {
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						case <-time.After(5 * time.Second):
+							return nil, errors.New("decryption did not receive cancellation")
+						}
+					},
+				},
+			}
+			_, err := lt.TestOp(Update).RunWithContext(
+				ctx, p.GetProject(), p.GetTarget(t, nil), p.Options, dryRun, nil, nil,
+			)
+			require.ErrorIs(t, err, context.Canceled)
+			require.Len(t, batches, 1)
+			assert.ElementsMatch(t, []string{"encrypted first", "encrypted nested"}, batches[0])
+		})
+	}
+}
+
+func TestConfigSecretRedactionRecoversFromBatchFailure(t *testing.T) {
+	t.Parallel()
+
+	first := config.MustMakeKey("test", "first")
+	second := config.MustMakeKey("test", "second")
+	programF := deploytest.NewLanguageRuntimeF(func(info plugin.RunInfo, _ *deploytest.ResourceMonitor) error {
+		assert.Equal(t, map[config.Key]string{
+			first: "redaction retry plaintext first", second: "redaction retry plaintext second",
+		}, info.Config)
+		return nil
+	})
+	var batches [][]string
+	p := &lt.TestPlan{
+		Options: lt.TestUpdateOptions{
+			T: t, SkipDisplayTests: true, HostF: deploytest.NewPluginHostF(nil, nil, programF, nil, nil),
+		},
+		Config: config.Map{
+			first:  config.NewSecureValue("encrypted first"),
+			second: config.NewSecureValue("encrypted second"),
+		},
+		Decrypter: configBatchDecrypter{
+			Decrypter: config.NewPanicCrypter(),
+			batch: func(_ context.Context, ciphertexts []string) ([]string, error) {
+				batches = append(batches, ciphertexts)
+				if len(batches) == 1 {
+					return nil, errors.New("redaction batch failed")
+				}
+				plaintexts := make([]string, len(ciphertexts))
+				for i, ciphertext := range ciphertexts {
+					plaintexts[i] = "redaction retry plaintext " + strings.TrimPrefix(ciphertext, "encrypted ")
+				}
+				return plaintexts, nil
+			},
+		},
+	}
+	_, err := lt.TestOp(Update).RunWithContext(
+		t.Context(), p.GetProject(), p.GetTarget(t, nil), p.Options, true /*dryRun*/, nil, nil,
+	)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(batches), 4)
+	assert.ElementsMatch(t, []string{"encrypted first", "encrypted second"}, batches[0])
+	assert.ElementsMatch(t, [][]string{{"encrypted first"}, {"encrypted second"}}, batches[1:3])
+	assert.ElementsMatch(t, []string{"encrypted first", "encrypted second"}, batches[3])
+}
+
+func TestConfigSecretRedactionDoesNotRetryProviderCancellation(t *testing.T) {
+	t.Parallel()
+
+	for _, cause := range []error{status.Error(codes.Canceled, "KMS canceled the request"), gcerrors.ErrDeadlineExceeded} {
+		providerErr := fmt.Errorf("decrypting configuration: %w", cause)
+		calls := 0
+		p := &lt.TestPlan{
+			Options: lt.TestUpdateOptions{T: t, SkipDisplayTests: true},
+			Config: config.Map{
+				config.MustMakeKey("test", "first"):  config.NewSecureValue("encrypted first"),
+				config.MustMakeKey("test", "second"): config.NewSecureValue("encrypted second"),
+			},
+			Decrypter: configBatchDecrypter{
+				Decrypter: config.NewPanicCrypter(),
+				batch: func(_ context.Context, ciphertexts []string) ([]string, error) {
+					calls++
+					if calls == 1 {
+						return nil, providerErr
+					}
+					return ciphertexts, nil
+				},
+			},
+		}
+		_, err := lt.TestOp(Update).RunWithContext(
+			t.Context(), p.GetProject(), p.GetTarget(t, nil), p.Options, true /*dryRun*/, nil, nil,
+		)
+		require.ErrorIs(t, err, providerErr)
+		require.Equal(t, 1, calls)
+	}
 }
 
 func TestBadResourceType(t *testing.T) {

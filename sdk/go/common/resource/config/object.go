@@ -74,12 +74,12 @@ func (c object) Secure() bool {
 func decryptMap(ctx context.Context, objectMap map[Key]object, decrypter Decrypter) (map[Key]Plaintext, error) {
 	// Collect all secure values
 	var refs []containerRef
-	var ctChunks [][]string
+	var ctChunks valueChunks
 	collectCiphertextSecrets(objectMap, &refs, &ctChunks)
 
 	// Decrypt objects in batches
 	offset := 0
-	for _, ctChunk := range ctChunks {
+	for _, ctChunk := range ctChunks.chunks {
 		if len(ctChunk) == 0 {
 			continue
 		}
@@ -349,19 +349,19 @@ func (c *object) Set(prefix, path resource.PropertyPath, new object) error {
 	}
 }
 
-// EncryptedValues returns the ciphertext values for any secure strings contained in the receiver.
-func (c object) EncryptedValues(valuesChunks *[][]string) {
+// collectEncryptedValues records the ciphertexts held by the receiver.
+func (c object) collectEncryptedValues(chunks *valueChunks) {
 	switch v := c.value.(type) {
 	case []object:
 		for _, v := range v {
-			v.EncryptedValues(valuesChunks)
+			v.collectEncryptedValues(chunks)
 		}
 	case map[string]object:
 		for _, v := range v {
-			v.EncryptedValues(valuesChunks)
+			v.collectEncryptedValues(chunks)
 		}
 	case CiphertextSecret:
-		addStringToChunks(valuesChunks, v.value, defaultMaxChunkSize)
+		chunks.add(v.value, defaultMaxChunkSize)
 	default:
 		return
 	}
