@@ -21,7 +21,9 @@ import (
 
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
+	resourceStack "github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	"github.com/pulumi/pulumi/pkg/v3/secrets/cloud"
 	"github.com/pulumi/pulumi/pkg/v3/secrets/passphrase"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
@@ -96,6 +98,67 @@ func TestStackSecretsManagerLoaderDecrypterFallsBack(t *testing.T) {
 		"A mock decrypter should have no effect on the project stack",
 	)
 	assert.Equal(t, plaintext, "defaulted plaintext", "Should have fallen back to the mock decrypter")
+}
+
+func TestStackSecretsManagerLoaderBindsCloudFallbackConfigContext(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	calls := 0
+	decrypter := stackConfigTestDecrypter(func(ctx context.Context, values []string) ([]string, error) {
+		calls++
+		assert.Equal(t, []string{"v2:wrapped:payload"}, values)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return []string{"secret"}, nil
+	})
+	stateManager := resourceStack.NewBatchingCachingSecretsManager(&secrets.MockSecretsManager{
+		TypeF:      func() string { return cloud.Type },
+		DecrypterF: func() config.Decrypter { return decrypter },
+		StateF: func() json.RawMessage {
+			return []byte(`{"url":"gcpkms://projects/fixture","encryptedkey":"a2V5"}`)
+		},
+	})
+	s := &backend.MockStack{
+		RefF: func() backend.StackReference {
+			return &backend.MockStackReference{FullyQualifiedNameV: "org/project/stack"}
+		},
+		SnapshotF: func(context.Context, secrets.Provider) (*deploy.Snapshot, error) {
+			return &deploy.Snapshot{SecretsManager: stateManager}, nil
+		},
+	}
+	loader := SecretsManagerLoader{FallbackToState: true}
+	projectStack := &workspace.ProjectStack{}
+	wrapped, state, err := loader.GetDecrypter(ctx, s, projectStack)
+	require.NoError(t, err)
+	assert.Equal(t, SecretsManagerShouldSave, state)
+	assert.Equal(t, "gcpkms://projects/fixture", projectStack.SecretsProvider)
+
+	cancel()
+	key := config.MustMakeKey("project", "secret")
+	settings := config.Map{key: config.NewSecureValue("v2:wrapped:payload")}
+	_, err = settings.Decrypt(wrapped)
+	require.ErrorIs(t, err, context.Canceled)
+	resolved, err := settings.Decrypt(stateManager.Decrypter())
+	require.NoError(t, err)
+	assert.Equal(t, "secret", resolved[key])
+	assert.Equal(t, 2, calls)
+}
+
+type stackConfigTestDecrypter func(context.Context, []string) ([]string, error)
+
+func (f stackConfigTestDecrypter) BatchDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
+	return f(ctx, ciphertexts)
+}
+
+func (f stackConfigTestDecrypter) DecryptValue(ctx context.Context, ciphertext string) (string, error) {
+	values, err := f(ctx, []string{ciphertext})
+	if err != nil {
+		return "", err
+	}
+	return values[0], nil
 }
 
 func TestStackSecretsManagerLoaderDecrypterUpdatesConfig(t *testing.T) {

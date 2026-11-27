@@ -17,6 +17,7 @@ package cloud
 import (
 	"context"
 	"crypto/cipher"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"strings"
@@ -36,11 +37,10 @@ import (
 const testGCPKMSURL = "gcpkms://projects/example/locations/global/keyRings/test/cryptoKeys/test"
 
 func TestGCPConfigEncryptOnly(t *testing.T) {
-	t.Parallel()
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", "")
 	ctx := t.Context()
 	keeper := newConfigTestKeeper(t)
-	_, wrappedStackKey, err := newWrappedDataKey(ctx, keeper)
-	require.NoError(t, err)
+	wrappedStackKey := wrapTestDataKey(t, keeper)
 
 	encodedStackKey := base64.StdEncoding.EncodeToString(wrappedStackKey)
 	ps := &workspace.ProjectStack{SecretsProvider: testGCPKMSURL, EncryptedKey: encodedStackKey}
@@ -75,8 +75,7 @@ func TestGCPConfigEncryptOnly(t *testing.T) {
 	assert.True(t, plaintexts[1] == value)
 	assert.JSONEq(t, `{"url":"`+mixedCaseURL+`","encryptedkey":"`+encodedStackKey+`"}`, string(reader.State()))
 
-	_, otherStackKey, err := newWrappedDataKey(ctx, keeper)
-	require.NoError(t, err)
+	otherStackKey := wrapTestDataKey(t, keeper)
 	otherStack, err := newCloudSecretsManagerWithKeeper(ctx, testGCPKMSURL, otherStackKey, keeper)
 	require.NoError(t, err)
 	_, err = otherStack.Decrypter().DecryptValue(ctx, ciphertexts[0])
@@ -84,7 +83,7 @@ func TestGCPConfigEncryptOnly(t *testing.T) {
 }
 
 func TestGCPConfigRequiresInitializedStack(t *testing.T) {
-	t.Parallel()
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", "")
 	ctx := t.Context()
 	ps := &workspace.ProjectStack{SecretsProvider: testGCPKMSURL}
 	open := func(context.Context, string) (ConfigKMSKeeper, error) {
@@ -118,6 +117,11 @@ func TestGCPConfigRejectsMalformedEnvelopeBeforeKMSCall(t *testing.T) {
 	require.ErrorContains(t, err, "decoding wrapped config secret data key")
 	_, err = reader.DecryptValue(ctx, "v2:YQ==:Yg==")
 	require.ErrorContains(t, err, "invalid GCP KMS config ciphertext length")
+	for _, size := range []int{maxGCPConfigWrappedKeySize + 1, maxGCPConfigWrappedKeySize + 3} {
+		wrapped := base64.StdEncoding.EncodeToString(make([]byte, size))
+		_, err = reader.DecryptValue(ctx, "v2:"+wrapped+":invalid payload")
+		require.ErrorContains(t, err, "wrapped config secret data key exceeds the size limit")
+	}
 	assert.Zero(t, keeper.decrypts.Load())
 }
 
@@ -130,14 +134,13 @@ func openTestGCPConfigEncrypter(
 }
 
 func TestGCPConfigDecryptOnlyWriter(t *testing.T) {
-	t.Parallel()
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", "")
 
 	ctx := t.Context()
 	keeper := newConfigTestKeeper(t)
 	keeper.allowDecrypt = true
 
-	_, wrappedStackKey, err := newWrappedDataKey(ctx, keeper)
-	require.NoError(t, err)
+	wrappedStackKey := wrapTestDataKey(t, keeper)
 	ps := &workspace.ProjectStack{
 		SecretsProvider: testGCPKMSURL,
 		EncryptedKey:    base64.StdEncoding.EncodeToString(wrappedStackKey),
@@ -145,32 +148,35 @@ func TestGCPConfigDecryptOnlyWriter(t *testing.T) {
 	enc, err := openTestGCPConfigEncrypter(ctx, ps, keeper)
 	require.NoError(t, err)
 	keeper.encryptErr = status.Error(codes.Unavailable, "KMS unavailable")
-	_, err = enc.EncryptValue(ctx, "transient failure")
-	require.Equal(t, codes.Unavailable, status.Code(err))
-	assert.Zero(t, keeper.decrypts.Load())
-
-	keeper.encryptErr = status.Error(codes.PermissionDenied, "KMS Encrypt denied")
 	ciphertext, err := enc.EncryptValue(ctx, "first value")
 	require.NoError(t, err)
+
+	keeper.encryptErr = status.Error(codes.PermissionDenied, "KMS Encrypt denied")
 	more, err := enc.BatchEncrypt(ctx, []string{"second value", "third value"})
 	require.NoError(t, err)
-	assert.EqualValues(t, 3, keeper.encrypts.Load())
-	assert.EqualValues(t, 1, keeper.decrypts.Load())
+	assert.EqualValues(t, 4, keeper.encrypts.Load())
+	assert.EqualValues(t, 3, keeper.decrypts.Load())
 
 	key, err := keeper.Decrypt(ctx, wrappedStackKey)
 	require.NoError(t, err)
 	plaintexts, err := config.NewSymmetricCrypter(key).BatchDecrypt(ctx, append([]string{ciphertext}, more...))
 	require.NoError(t, err)
 	assert.Equal(t, []string{"first value", "second value", "third value"}, plaintexts)
+
+	keeper.encryptErr = nil
+	ciphertext, err = enc.EncryptValue(ctx, "KMS recovered")
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(ciphertext, gcpConfigCiphertextPrefix))
+	assert.EqualValues(t, 5, keeper.encrypts.Load())
+	assert.EqualValues(t, 4, keeper.decrypts.Load())
 }
 
 func TestGCPConfigWriterUsesExistingStackKeyWhenPrimaryIsDisabled(t *testing.T) {
-	t.Parallel()
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", "")
 
 	ctx := t.Context()
 	keeper := newConfigTestKeeper(t)
-	_, wrappedStackKey, err := newWrappedDataKey(ctx, keeper)
-	require.NoError(t, err)
+	wrappedStackKey := wrapTestDataKey(t, keeper)
 	encodedStackKey := base64.StdEncoding.EncodeToString(wrappedStackKey)
 	ps := &workspace.ProjectStack{SecretsProvider: testGCPKMSURL, EncryptedKey: encodedStackKey}
 	enc, err := openTestGCPConfigEncrypter(ctx, ps, keeper)
@@ -180,16 +186,14 @@ func TestGCPConfigWriterUsesExistingStackKeyWhenPrimaryIsDisabled(t *testing.T) 
 	keeper.encryptErr = primaryDisabled
 	_, err = enc.EncryptValue(ctx, "no decryption permission")
 	require.ErrorIs(t, err, primaryDisabled)
+	require.ErrorIs(t, err, errTestConfigDecryptDenied)
+	assert.EqualValues(t, 1, keeper.decrypts.Load())
 
 	keeper.allowDecrypt = true
 	ciphertext, err := enc.EncryptValue(ctx, "config value")
 	require.NoError(t, err)
 	assert.True(t, strings.HasPrefix(ciphertext, "v1:"))
 	assert.Equal(t, encodedStackKey, ps.EncryptedKey)
-	attempts := keeper.encrypts.Load()
-	_, err = enc.EncryptValue(ctx, "another config value")
-	require.NoError(t, err)
-	assert.Equal(t, attempts, keeper.encrypts.Load(), "reuse the unwrapped legacy key")
 	assert.EqualValues(t, 2, keeper.decrypts.Load())
 
 	reader, err := newCloudSecretsManagerWithKeeper(ctx, testGCPKMSURL, wrappedStackKey, keeper)
@@ -197,6 +201,108 @@ func TestGCPConfigWriterUsesExistingStackKeyWhenPrimaryIsDisabled(t *testing.T) 
 	plaintext, err := reader.Decrypter().DecryptValue(ctx, ciphertext)
 	require.NoError(t, err)
 	assert.Equal(t, "config value", plaintext)
+}
+
+func TestGCPConfigWriterDoesNotFallBackOnCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	keeper := newConfigTestKeeper(t)
+	keeper.encryptErr = status.Error(codes.Unavailable, "KMS unavailable")
+	keeper.onEncrypt = cancel
+	encrypter := &gcpConfigEncrypter{keeper: keeper, stackKey: []byte("wrapped stack key")}
+	_, err := encrypter.EncryptValue(ctx, "secret")
+	require.ErrorIs(t, err, context.Canceled)
+	assert.EqualValues(t, 1, keeper.encrypts.Load())
+	assert.Zero(t, keeper.decrypts.Load())
+
+	_, err = encrypter.EncryptValue(ctx, "secret")
+	require.ErrorIs(t, err, context.Canceled)
+	assert.EqualValues(t, 1, keeper.encrypts.Load())
+	assert.Zero(t, keeper.decrypts.Load())
+}
+
+type configUnwrapperFunc func(context.Context, []byte) ([]byte, error)
+
+func (f configUnwrapperFunc) Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error) {
+	return f(ctx, ciphertext)
+}
+
+func TestGCPConfigDecryptChecksCancellationAfterUnwrap(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		batch bool
+	}{
+		{name: "individual value"},
+		{name: "one-element batch", batch: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			keeper := newConfigTestKeeper(t)
+			keeper.allowDecrypt = true
+			encrypter := &gcpConfigEncrypter{keeper: keeper, stackKey: []byte("wrapped stack key")}
+			ciphertext, err := encrypter.EncryptValue(t.Context(), "secret")
+			require.NoError(t, err)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			decrypter := gcpConfigDecrypter{
+				keeper: configUnwrapperFunc(func(ctx context.Context, ciphertext []byte) ([]byte, error) {
+					cancel()
+					return keeper.Decrypt(ctx, ciphertext)
+				}),
+				stackKey: encrypter.stackKey,
+			}
+			if tc.batch {
+				plaintexts, err := decrypter.BatchDecrypt(ctx, []string{ciphertext})
+				require.ErrorIs(t, err, context.Canceled)
+				assert.Nil(t, plaintexts)
+			} else {
+				plaintext, err := decrypter.DecryptValue(ctx, ciphertext)
+				require.ErrorIs(t, err, context.Canceled)
+				assert.Empty(t, plaintext)
+			}
+			assert.EqualValues(t, 1, keeper.decrypts.Load())
+		})
+	}
+}
+
+func TestGCPConfigBatchDecryptMixedDeduplicatesEnvelopes(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	keeper := newConfigTestKeeper(t)
+	keeper.allowDecrypt = true
+	encrypter := &gcpConfigEncrypter{keeper: keeper, stackKey: []byte("wrapped stack key")}
+	first, err := encrypter.EncryptValue(ctx, "first")
+	require.NoError(t, err)
+	second, err := encrypter.EncryptValue(ctx, "second")
+	require.NoError(t, err)
+
+	legacyCalls := 0
+	decrypter := gcpConfigDecrypter{
+		keeper:   keeper,
+		stackKey: encrypter.stackKey,
+		legacy: legacyConfigBatchSpy{batch: func(_ context.Context, values []string) ([]string, error) {
+			legacyCalls++
+			assert.Equal(t, []string{"v1:one", "v1:two", "v1:one"}, values)
+			return []string{"one", "two", "one"}, nil
+		}},
+	}
+	plaintexts, err := decrypter.BatchDecrypt(ctx, []string{first, "v1:one", second, first, "v1:two", "v1:one", second})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"first", "one", "second", "first", "two", "one", "second"}, plaintexts)
+	assert.Equal(t, 1, legacyCalls)
+	assert.EqualValues(t, 2, keeper.decrypts.Load())
+
+	plaintexts, err = decrypter.BatchDecrypt(ctx, []string{second, second})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"second", "second"}, plaintexts)
+	assert.EqualValues(t, 3, keeper.decrypts.Load(), "only deduplicate within a batch")
 }
 
 type legacyConfigBatchSpy struct {
@@ -238,9 +344,8 @@ func TestGCPConfigBatchDecryptLegacy(t *testing.T) {
 			calls := 0
 			decrypter := gcpConfigDecrypter{
 				legacy: legacyConfigBatchSpy{
-					batch: func(batchCtx context.Context, batch []string) ([]string, error) {
+					batch: func(_ context.Context, batch []string) ([]string, error) {
 						calls++
-						assert.Same(t, ctx, batchCtx)
 						assert.Equal(t, []string{"v1:ciphertext1", "v1:ciphertext2", "v1:ciphertext3"}, batch)
 						if tt.cancelDuring {
 							cancel()
@@ -268,15 +373,21 @@ func TestGCPConfigBatchCancelsInFlightRequests(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	values := make([]string, gcpConfigBatchConcurrency*2)
+	keeper := newConfigTestKeeper(t)
+	encrypter := &gcpConfigEncrypter{keeper: keeper}
+	values, err := encrypter.BatchEncrypt(ctx, make([]string, gcpConfigBatchConcurrency*2))
+	require.NoError(t, err)
 	started := make(chan struct{}, len(values))
-	result := make(chan error, 1)
-	go func() {
-		_, err := transformConfigBatch(ctx, values, func(ctx context.Context, _ string) (string, error) {
+	decrypter := gcpConfigDecrypter{
+		keeper: configUnwrapperFunc(func(ctx context.Context, _ []byte) ([]byte, error) {
 			started <- struct{}{}
 			<-ctx.Done()
-			return "", ctx.Err()
-		})
+			return nil, ctx.Err()
+		}),
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := decrypter.BatchDecrypt(ctx, values)
 		result <- err
 	}()
 
@@ -297,10 +408,23 @@ func TestGCPConfigBatchCancelsInFlightRequests(t *testing.T) {
 	require.Empty(t, started, "cancellation should prevent further KMS requests")
 }
 
+func wrapTestDataKey(t *testing.T, keeper ConfigKMSKeeper) []byte {
+	t.Helper()
+	key := make([]byte, config.SymmetricCrypterKeyBytes)
+	_, err := rand.Read(key)
+	require.NoError(t, err)
+	wrapped, err := keeper.Encrypt(t.Context(), key)
+	require.NoError(t, err)
+	return wrapped
+}
+
+var errTestConfigDecryptDenied = errors.New("KMS decryption permission denied")
+
 type configTestKeeper struct {
 	aead         cipher.AEAD
 	allowDecrypt bool
 	encryptErr   error
+	onEncrypt    func()
 	encrypts     atomic.Int32
 	decrypts     atomic.Int32
 }
@@ -314,6 +438,9 @@ func newConfigTestKeeper(t *testing.T) *configTestKeeper {
 
 func (k *configTestKeeper) Encrypt(_ context.Context, plaintext []byte) ([]byte, error) {
 	k.encrypts.Add(1)
+	if k.onEncrypt != nil {
+		k.onEncrypt()
+	}
 	if k.encryptErr != nil {
 		return nil, k.encryptErr
 	}
@@ -326,7 +453,7 @@ func (k *configTestKeeper) Encrypt(_ context.Context, plaintext []byte) ([]byte,
 func (k *configTestKeeper) Decrypt(_ context.Context, ciphertext []byte) ([]byte, error) {
 	k.decrypts.Add(1)
 	if !k.allowDecrypt {
-		return nil, errors.New("KMS decryption permission denied")
+		return nil, errTestConfigDecryptDenied
 	}
 	return k.aead.Open(nil, nil, ciphertext, nil)
 }

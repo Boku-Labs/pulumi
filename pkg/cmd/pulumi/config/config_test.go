@@ -570,7 +570,7 @@ func TestConfigSet(t *testing.T) {
 }
 
 func TestConfigSetSecretPreservesInitializedKMSMetadata(t *testing.T) {
-	t.Parallel()
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", "")
 	ctx := t.Context()
 
 	const provider = "gcpkms://projects/example/locations/global/keyRings/test/cryptoKeys/test"

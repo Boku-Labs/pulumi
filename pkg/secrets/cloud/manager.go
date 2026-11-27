@@ -22,15 +22,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	netUrl "net/url"
 	"strings"
 
+	kms "cloud.google.com/go/kms/apiv1"
 	gosecrets "gocloud.dev/secrets"
 	_ "gocloud.dev/secrets/awskms"        // support for awskms://
 	_ "gocloud.dev/secrets/azurekeyvault" // support for azurekeyvault://
 	"gocloud.dev/secrets/gcpkms"          // support for gcpkms://
 	_ "gocloud.dev/secrets/hashivault"    // support for hashivault://
+	"golang.org/x/oauth2"
 	"google.golang.org/api/cloudkms/v1"
+	"google.golang.org/api/option"
 
 	"github.com/pulumi/pulumi/pkg/v3/authhelpers"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
@@ -60,7 +64,7 @@ func openKeeper(ctx context.Context, url string) (*gosecrets.Keeper, error) {
 			return nil, fmt.Errorf("missing google credentials: %w", err)
 		}
 
-		kmsClient, _, err := gcpkms.Dial(ctx, credentials.TokenSource)
+		kmsClient, err := newGCPKMSClient(ctx, credentials.TokenSource)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to gcpkms: %w", err)
 		}
@@ -72,6 +76,16 @@ func openKeeper(ctx context.Context, url string) (*gosecrets.Keeper, error) {
 	default:
 		return gosecrets.OpenKeeper(ctx, url)
 	}
+}
+
+func newGCPKMSClient(
+	ctx context.Context, tokenSource oauth2.TokenSource, opts ...option.ClientOption,
+) (*kms.KeyManagementClient, error) {
+	return kms.NewKeyManagementClient(ctx, append([]option.ClientOption{
+		option.WithTokenSource(tokenSource),
+		option.WithUserAgent("go-cloud/secrets/0.46.0"),
+		option.WithLogger(slog.New(slog.DiscardHandler)),
+	}, opts...)...)
 }
 
 // generateNewDataKey generates a new DataKey seeded by a fresh random 32-byte key and encrypted
@@ -152,6 +166,43 @@ func (m *Manager) State() json.RawMessage      { return m.state }
 func (m *Manager) Encrypter() config.Encrypter { return m.crypter }
 func (m *Manager) Decrypter() config.Decrypter { return m.crypter }
 
+// WithConfigDecryptionContext binds a context for GCP KMS config decryption through SDK
+// methods that supply context.TODO. The original manager is left intact.
+func WithConfigDecryptionContext(ctx context.Context, manager secrets.Manager, provider string) secrets.Manager {
+	if parseGCPKMSProvider(provider) == nil || manager == nil || manager.Type() != Type {
+		return manager
+	}
+	return configDecryptionContextManager{Manager: manager, ctx: ctx}
+}
+
+type configDecryptionContextManager struct {
+	secrets.Manager
+	ctx context.Context
+}
+
+func (m configDecryptionContextManager) Decrypter() config.Decrypter {
+	return configDecryptionContext{m.Manager.Decrypter(), m.ctx}
+}
+
+type configDecryptionContext struct {
+	decrypter config.Decrypter
+	ctx       context.Context
+}
+
+func (d configDecryptionContext) DecryptValue(ctx context.Context, ciphertext string) (string, error) {
+	if ctx == context.TODO() && strings.HasPrefix(ciphertext, gcpConfigCiphertextPrefix) {
+		ctx = d.ctx
+	}
+	return d.decrypter.DecryptValue(ctx, ciphertext)
+}
+
+func (d configDecryptionContext) BatchDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
+	if ctx == context.TODO() && hasGCPConfigCiphertext(ciphertexts) {
+		ctx = d.ctx
+	}
+	return d.decrypter.BatchDecrypt(ctx, ciphertexts)
+}
+
 func EditProjectStack(info *workspace.ProjectStack, state json.RawMessage) error {
 	info.EncryptionSalt = ""
 
@@ -209,8 +260,19 @@ func NewCloudSecretsManager(info *workspace.ProjectStack,
 	provider := effectiveCloudSecretsProvider(secretsProvider)
 	if !rotateSecretsProvider && secretsProvider == info.SecretsProvider &&
 		parseGCPKMSProvider(secretsProvider) != nil &&
-		(info.EncryptedKey == "" || provider != secretsProvider) && info.Config.HasSecureValue() {
-		return nil, errors.New("cannot replace the wrapped stack key while encrypted configuration exists")
+		(info.EncryptedKey == "" || provider != secretsProvider) {
+		for _, value := range info.Config {
+			if !value.Secure() {
+				continue
+			}
+			ciphertexts, err := value.SecureValues(config.NopDecrypter)
+			if err != nil {
+				return nil, err
+			}
+			if hasGCPConfigCiphertext(ciphertexts) {
+				return nil, errors.New("cannot replace the wrapped stack key while v2 encrypted configuration exists")
+			}
+		}
 	}
 	secretsProvider = provider
 

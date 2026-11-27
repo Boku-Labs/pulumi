@@ -70,16 +70,7 @@ func CreateSecretsManagerForExistingStack(
 	}
 
 	oldConfig := deepcopy.Copy(ps).(*workspace.ProjectStack)
-	if isDefaultSecretsProvider {
-		_, err = stack.DefaultSecretManager(ctx, ps)
-	} else if secretsProvider == passphrase.Type {
-		_, err = passphrase.NewPromptingPassphraseSecretsManager(ps, rotateSecretsProvider)
-	} else {
-		// All other non-default secrets providers are handled by the cloud secrets provider which
-		// uses a URL schema to identify the provider
-		_, err = cloud.NewCloudSecretsManager(ps, secretsProvider, rotateSecretsProvider)
-	}
-	if err != nil {
+	if err := configureSecretsManagerForExistingStack(ctx, stack, ps, secretsProvider, rotateSecretsProvider); err != nil {
 		return err
 	}
 
@@ -91,6 +82,21 @@ func CreateSecretsManagerForExistingStack(
 	}
 
 	return nil
+}
+
+func configureSecretsManagerForExistingStack(
+	ctx context.Context, stack backend.Stack, ps *workspace.ProjectStack, provider string, rotate bool,
+) error {
+	if provider == "" || provider == "default" {
+		_, err := stack.DefaultSecretManager(ctx, ps)
+		return err
+	}
+	if provider == passphrase.Type {
+		_, err := passphrase.NewPromptingPassphraseSecretsManager(ps, rotate)
+		return err
+	}
+	_, err := cloud.NewCloudSecretsManager(ps, provider, rotate)
+	return err
 }
 
 // Creates a secrets manager for a new stack. If a stack configuration already exists (e.g. the user has created a
@@ -303,7 +309,7 @@ func (l *SecretsManagerLoader) GetSecretsManager(
 		state = SecretsManagerUnchanged
 	}
 
-	bsm := stack.NewBatchingCachingSecretsManager(sm)
+	bsm := stack.NewBatchingCachingSecretsManager(cloud.WithConfigDecryptionContext(ctx, sm, ps.SecretsProvider))
 
 	fqn := string(s.Ref().FullyQualifiedName())
 	if err := pkgLogging.UpgradeCurrentLogger(ctx, fqn, "", bsm); err != nil {

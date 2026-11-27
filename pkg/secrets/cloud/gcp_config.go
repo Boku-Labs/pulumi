@@ -26,28 +26,21 @@ import (
 	"os"
 	"path"
 	"strings"
-	"sync"
-	"sync/atomic"
 
 	"gocloud.dev/secrets/gcpkms"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
 const (
-	gcpConfigCiphertextPrefix = "v2:"
-	gcpConfigBatchConcurrency = 8
-	gcmNonceSize              = 12
-	gcmTagSize                = 16
+	gcpConfigCiphertextPrefix  = "v2:"
+	gcpConfigBatchConcurrency  = 8
+	maxGCPConfigWrappedKeySize = 64 * 1024
+	gcmNonceSize               = 12
+	gcmTagSize                 = 16
 )
-
-type dataKeyWrapper interface {
-	Encrypt(context.Context, []byte) ([]byte, error)
-}
 
 type dataKeyUnwrapper interface {
 	Decrypt(context.Context, []byte) ([]byte, error)
@@ -55,7 +48,7 @@ type dataKeyUnwrapper interface {
 
 // ConfigKMSKeeper wraps and unwraps data keys for GCP KMS configuration values.
 type ConfigKMSKeeper interface {
-	dataKeyWrapper
+	Encrypt(context.Context, []byte) ([]byte, error)
 	dataKeyUnwrapper
 }
 
@@ -98,87 +91,64 @@ func NewConfigEncrypter(
 	return &gcpConfigEncrypter{keeper: keeper, stackKey: stackKey}, nil
 }
 
-func newWrappedDataKey(ctx context.Context, keeper dataKeyWrapper) (key, wrapped []byte, err error) {
-	key = make([]byte, config.SymmetricCrypterKeyBytes)
-	if _, err := rand.Read(key); err != nil {
-		return nil, nil, err
-	}
-	wrapped, err = keeper.Encrypt(ctx, key)
-	if err != nil {
-		return nil, nil, err
-	}
-	return key, wrapped, nil
-}
-
 // The envelope stores a KMS-wrapped data key and a nonce-prefixed AES-GCM
 // ciphertext. The wrapped stack key binds the value to its stack's encryption key.
 type gcpConfigEncrypter struct {
-	keeper    ConfigKMSKeeper
-	stackKey  []byte
-	useLegacy atomic.Bool
-	legacyMu  sync.Mutex
-	legacy    config.Encrypter
+	keeper   ConfigKMSKeeper
+	stackKey []byte
 }
 
 func (e *gcpConfigEncrypter) EncryptValue(ctx context.Context, plaintext string) (string, error) {
-	var encryptErr error
-	if !e.useLegacy.Load() {
-		ciphertext, err := e.encryptEnvelope(ctx, plaintext)
-		code := status.Code(err)
-		// A disabled primary can prevent new wraps while an older version can still unwrap the stack key.
-		if code != codes.PermissionDenied && code != codes.FailedPrecondition {
-			return ciphertext, err
-		}
-		encryptErr = err
-	}
-
-	legacy, err := e.legacyEncrypter(ctx)
-	if err != nil {
-		if encryptErr != nil {
-			return "", fmt.Errorf("KMS Encrypt failed (%w) and the stack key could not be decrypted: %w", encryptErr, err)
-		}
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	e.useLegacy.Store(true)
-	return legacy.EncryptValue(ctx, plaintext)
-}
-
-func (e *gcpConfigEncrypter) legacyEncrypter(ctx context.Context) (config.Encrypter, error) {
-	e.legacyMu.Lock()
-	defer e.legacyMu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	key := make([]byte, config.SymmetricCrypterKeyBytes)
+	if _, err := rand.Read(key); err != nil {
+		return "", err
 	}
-	if e.legacy != nil {
-		return e.legacy, nil
+	wrapped, err := e.keeper.Encrypt(ctx, key)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
 	}
-	key, err := e.keeper.Decrypt(ctx, e.stackKey)
 	if err != nil {
-		return nil, err
-	}
-	if len(key) != config.SymmetricCrypterKeyBytes {
-		return nil, errors.New("invalid stack data key length")
-	}
-	e.legacy = config.NewSymmetricCrypter(key)
-	return e.legacy, nil
-}
-
-func (e *gcpConfigEncrypter) encryptEnvelope(ctx context.Context, plaintext string) (string, error) {
-	key, wrapped, err := newWrappedDataKey(ctx, e.keeper)
-	if err != nil {
-		return "", fmt.Errorf("wrapping config secret data key: %w", err)
+		return e.encryptLegacy(ctx, plaintext, err)
 	}
 	aead, err := newConfigAEAD(key)
 	if err != nil {
 		return "", err
 	}
 	ciphertext := aead.Seal(nil, nil, []byte(plaintext), e.stackKey) //nolint:gosec // The AEAD generates a random nonce.
-	return gcpConfigCiphertextPrefix + base64.StdEncoding.EncodeToString(wrapped) + ":" +
-		base64.StdEncoding.EncodeToString(ciphertext), nil
+	encoded := gcpConfigCiphertextPrefix + base64.StdEncoding.EncodeToString(wrapped) + ":" +
+		base64.StdEncoding.EncodeToString(ciphertext)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return encoded, nil
+}
+
+func (e *gcpConfigEncrypter) encryptLegacy(ctx context.Context, plaintext string, wrapErr error) (string, error) {
+	key, err := e.keeper.Decrypt(ctx, e.stackKey)
+	if err == nil && len(key) != config.SymmetricCrypterKeyBytes {
+		err = errors.New("invalid stack data key length")
+	}
+	if err != nil {
+		return "", fmt.Errorf("KMS Encrypt failed (%w) and the stack key could not be decrypted: %w", wrapErr, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	ciphertext, err := config.NewSymmetricCrypter(key).EncryptValue(ctx, plaintext)
+	if err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return ciphertext, nil
 }
 
 func (e *gcpConfigEncrypter) BatchEncrypt(ctx context.Context, plaintexts []string) ([]string, error) {
-	return transformConfigBatch(ctx, plaintexts, e.EncryptValue)
+	return config.DefaultBatchEncrypt(ctx, e, plaintexts)
 }
 
 type gcpConfigDecrypter struct {
@@ -192,13 +162,22 @@ func (d gcpConfigDecrypter) DecryptValue(ctx context.Context, ciphertext string)
 	if !ok {
 		return d.legacy.DecryptValue(ctx, ciphertext)
 	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	wrappedText, payloadText, ok := strings.Cut(envelope, ":")
 	if !ok || wrappedText == "" || payloadText == "" {
 		return "", errors.New("invalid GCP KMS config ciphertext")
 	}
+	if len(wrappedText) > base64.StdEncoding.EncodedLen(maxGCPConfigWrappedKeySize) {
+		return "", errors.New("wrapped config secret data key exceeds the size limit")
+	}
 	wrapped, err := base64.StdEncoding.DecodeString(wrappedText)
 	if err != nil {
 		return "", fmt.Errorf("decoding wrapped config secret data key: %w", err)
+	}
+	if len(wrapped) > maxGCPConfigWrappedKeySize {
+		return "", errors.New("wrapped config secret data key exceeds the size limit")
 	}
 	payload, err := base64.StdEncoding.DecodeString(payloadText)
 	if err != nil {
@@ -219,6 +198,9 @@ func (d gcpConfigDecrypter) DecryptValue(ctx context.Context, ciphertext string)
 	if err != nil {
 		return "", fmt.Errorf("decrypting config secret: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	return string(value), nil
 }
 
@@ -229,14 +211,52 @@ func (d gcpConfigDecrypter) BatchDecrypt(ctx context.Context, ciphertexts []stri
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	for _, ciphertext := range ciphertexts {
-		if strings.HasPrefix(ciphertext, gcpConfigCiphertextPrefix) {
-			return transformConfigBatch(ctx, ciphertexts, d.DecryptValue)
+	if !hasGCPConfigCiphertext(ciphertexts) {
+		return d.batchDecryptLegacy(ctx, ciphertexts)
+	}
+
+	var legacy, envelopes []string
+	var legacyPositions []int
+	envelopeIndexes := make(map[string]int)
+	for i, ciphertext := range ciphertexts {
+		if !strings.HasPrefix(ciphertext, gcpConfigCiphertextPrefix) {
+			legacy = append(legacy, ciphertext)
+			legacyPositions = append(legacyPositions, i)
+			continue
+		}
+		if _, exists := envelopeIndexes[ciphertext]; !exists {
+			envelopeIndexes[ciphertext] = len(envelopes)
+			envelopes = append(envelopes, ciphertext)
+		}
+	}
+
+	plaintexts := make([]string, len(ciphertexts))
+	if len(legacy) > 0 {
+		values, err := d.batchDecryptLegacy(ctx, legacy)
+		if err != nil {
+			return nil, err
+		}
+		for i, pos := range legacyPositions {
+			plaintexts[pos] = values[i]
+		}
+	}
+
+	values, err := transformConfigBatch(ctx, envelopes, d.DecryptValue)
+	if err != nil {
+		return nil, err
+	}
+	for i, ciphertext := range ciphertexts {
+		if index, ok := envelopeIndexes[ciphertext]; ok {
+			plaintexts[i] = values[index]
 		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	return plaintexts, nil
+}
+
+func (d gcpConfigDecrypter) batchDecryptLegacy(ctx context.Context, ciphertexts []string) ([]string, error) {
 	plaintexts, err := d.legacy.BatchDecrypt(ctx, ciphertexts)
 	if err != nil {
 		return nil, err
@@ -245,6 +265,15 @@ func (d gcpConfigDecrypter) BatchDecrypt(ctx context.Context, ciphertexts []stri
 		return nil, err
 	}
 	return plaintexts, nil
+}
+
+func hasGCPConfigCiphertext(ciphertexts []string) bool {
+	for _, ciphertext := range ciphertexts {
+		if strings.HasPrefix(ciphertext, gcpConfigCiphertextPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // transformConfigBatch limits concurrent KMS requests and preserves input order.
@@ -257,6 +286,9 @@ func transformConfigBatch(
 	case 1:
 		value, err := transform(ctx, values[0])
 		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		return []string{value}, nil
