@@ -1,0 +1,4 @@
+component: cli
+kind: fix
+body: Allow pulumi config set --secret with encrypt-only access on initialized Google Cloud KMS stacks
+time: 2026-11-20T19:30:00Z

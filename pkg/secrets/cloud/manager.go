@@ -20,17 +20,21 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	netUrl "net/url"
-	"os"
 	"strings"
 
+	kms "cloud.google.com/go/kms/apiv1"
 	gosecrets "gocloud.dev/secrets"
 	_ "gocloud.dev/secrets/awskms"        // support for awskms://
 	_ "gocloud.dev/secrets/azurekeyvault" // support for azurekeyvault://
 	"gocloud.dev/secrets/gcpkms"          // support for gcpkms://
 	_ "gocloud.dev/secrets/hashivault"    // support for hashivault://
+	"golang.org/x/oauth2"
 	"google.golang.org/api/cloudkms/v1"
+	"google.golang.org/api/option"
 
 	"github.com/pulumi/pulumi/pkg/v3/authhelpers"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
@@ -60,7 +64,7 @@ func openKeeper(ctx context.Context, url string) (*gosecrets.Keeper, error) {
 			return nil, fmt.Errorf("missing google credentials: %w", err)
 		}
 
-		kmsClient, _, err := gcpkms.Dial(ctx, credentials.TokenSource)
+		kmsClient, err := newGCPKMSClient(ctx, credentials.TokenSource)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to gcpkms: %w", err)
 		}
@@ -72,6 +76,16 @@ func openKeeper(ctx context.Context, url string) (*gosecrets.Keeper, error) {
 	default:
 		return gosecrets.OpenKeeper(ctx, url)
 	}
+}
+
+func newGCPKMSClient(
+	ctx context.Context, tokenSource oauth2.TokenSource, opts ...option.ClientOption,
+) (*kms.KeyManagementClient, error) {
+	return kms.NewKeyManagementClient(ctx, append([]option.ClientOption{
+		option.WithTokenSource(tokenSource),
+		option.WithUserAgent("go-cloud/secrets/0.46.0"),
+		option.WithLogger(slog.New(slog.DiscardHandler)),
+	}, opts...)...)
 }
 
 // generateNewDataKey generates a new DataKey seeded by a fresh random 32-byte key and encrypted
@@ -92,23 +106,35 @@ func generateNewDataKey(url string) ([]byte, error) {
 // newCloudSecretsManager returns a secrets manager that uses the target cloud key management
 // service to encrypt/decrypt a data key used for envelope encryption of secrets values.
 func newCloudSecretsManager(url string, encryptedDataKey []byte) (*Manager, error) {
-	keeper, err := openKeeper(context.Background(), url)
+	ctx := context.Background()
+	keeper, err := openKeeper(ctx, url)
 	if err != nil {
 		return nil, err
 	}
+	return newCloudSecretsManagerWithKeeper(ctx, url, encryptedDataKey, keeper)
+}
+
+func newCloudSecretsManagerWithKeeper(
+	ctx context.Context, url string, encryptedDataKey []byte, keeper dataKeyUnwrapper,
+) (*Manager, error) {
 	// We're emulating gocloud.dev's old behaviour here. Pre v0.28.0 it used to have an inner wrapping, which
 	// we keep for compatibility (see above). However the newer version expects this to be unwrapped, before
 	// it's used, so let's do that here.
 	ciphertext := encryptedDataKey
 	if strings.HasPrefix(url, "azurekeyvault://") {
-		ciphertext, err = base64.RawURLEncoding.DecodeString(string(encryptedDataKey))
+		decoded, err := base64.RawURLEncoding.DecodeString(string(encryptedDataKey))
 		if err != nil {
 			return nil, err
 		}
+		ciphertext = decoded
 	}
-	plaintextDataKey, err := keeper.Decrypt(context.Background(), ciphertext)
+	plaintextDataKey, err := keeper.Decrypt(ctx, ciphertext)
 	if err != nil {
 		return nil, err
+	}
+	if len(plaintextDataKey) != config.SymmetricCrypterKeyBytes {
+		return nil, fmt.Errorf("invalid stack data key length: got %d bytes, want %d",
+			len(plaintextDataKey), config.SymmetricCrypterKeyBytes)
 	}
 	state, err := json.Marshal(cloudSecretsManagerState{
 		URL:          url,
@@ -118,7 +144,11 @@ func newCloudSecretsManager(url string, encryptedDataKey []byte) (*Manager, erro
 		return nil, fmt.Errorf("marshalling state: %w", err)
 	}
 	crypter := config.NewSymmetricCrypter(plaintextDataKey)
-	cachedCrypter := config.NewCiphertextToPlaintextCachedCrypter(crypter, crypter)
+	var decrypter config.Decrypter = crypter
+	if parseGCPKMSProvider(url) != nil {
+		decrypter = gcpConfigDecrypter{legacy: crypter, keeper: keeper, stackKey: encryptedDataKey}
+	}
+	cachedCrypter := config.NewCiphertextToPlaintextCachedCrypter(crypter, decrypter)
 	return &Manager{
 		crypter: cachedCrypter,
 		state:   state,
@@ -135,6 +165,43 @@ func (m *Manager) Type() string                { return Type }
 func (m *Manager) State() json.RawMessage      { return m.state }
 func (m *Manager) Encrypter() config.Encrypter { return m.crypter }
 func (m *Manager) Decrypter() config.Decrypter { return m.crypter }
+
+// WithConfigDecryptionContext binds a context for GCP KMS config decryption through SDK
+// methods that supply context.TODO. The original manager is left intact.
+func WithConfigDecryptionContext(ctx context.Context, manager secrets.Manager, provider string) secrets.Manager {
+	if parseGCPKMSProvider(provider) == nil || manager == nil || manager.Type() != Type {
+		return manager
+	}
+	return configDecryptionContextManager{Manager: manager, ctx: ctx}
+}
+
+type configDecryptionContextManager struct {
+	secrets.Manager
+	ctx context.Context
+}
+
+func (m configDecryptionContextManager) Decrypter() config.Decrypter {
+	return configDecryptionContext{m.Manager.Decrypter(), m.ctx}
+}
+
+type configDecryptionContext struct {
+	decrypter config.Decrypter
+	ctx       context.Context
+}
+
+func (d configDecryptionContext) DecryptValue(ctx context.Context, ciphertext string) (string, error) {
+	if ctx == context.TODO() && strings.HasPrefix(ciphertext, gcpConfigCiphertextPrefix) {
+		ctx = d.ctx
+	}
+	return d.decrypter.DecryptValue(ctx, ciphertext)
+}
+
+func (d configDecryptionContext) BatchDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
+	if ctx == context.TODO() && hasGCPConfigCiphertext(ciphertexts) {
+		ctx = d.ctx
+	}
+	return d.decrypter.BatchDecrypt(ctx, ciphertexts)
+}
 
 func EditProjectStack(info *workspace.ProjectStack, state json.RawMessage) error {
 	info.EncryptionSalt = ""
@@ -188,19 +255,33 @@ func NewCloudSecretsManagerFromState(state json.RawMessage) (secrets.Manager, er
 func NewCloudSecretsManager(info *workspace.ProjectStack,
 	secretsProvider string, rotateSecretsProvider bool,
 ) (secrets.Manager, error) {
+	// V2 ciphertext is bound to the wrapped stack key. Replacing its key
+	// requires an explicit provider change or rotation.
+	provider := effectiveCloudSecretsProvider(secretsProvider)
+	if !rotateSecretsProvider && secretsProvider == info.SecretsProvider &&
+		parseGCPKMSProvider(secretsProvider) != nil &&
+		(info.EncryptedKey == "" || provider != secretsProvider) {
+		for _, value := range info.Config {
+			if !value.Secure() {
+				continue
+			}
+			ciphertexts, err := value.SecureValues(config.NopDecrypter)
+			if err != nil {
+				return nil, err
+			}
+			if hasGCPConfigCiphertext(ciphertexts) {
+				return nil, errors.New("cannot replace the wrapped stack key while v2 encrypted configuration exists")
+			}
+		}
+	}
+	secretsProvider = provider
+
 	// Only a passphrase provider has an encryption salt. So changing a secrets provider
 	// from passphrase to a cloud secrets provider should ensure that we remove the enryptionsalt
 	// as it's a legacy artifact and needs to be removed
 	info.EncryptionSalt = ""
 
 	var secretsManager *Manager
-
-	// Allow per-execution override of the secrets provider via an environment
-	// variable. This allows a temporary replacement without updating the stack
-	// config, such a during CI.
-	if override := os.Getenv("PULUMI_CLOUD_SECRET_OVERRIDE"); override != "" {
-		secretsProvider = override
-	}
 
 	// If we're rotating then just clear the key so we create a fresh one below
 	if rotateSecretsProvider {

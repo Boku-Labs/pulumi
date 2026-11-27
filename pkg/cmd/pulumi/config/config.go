@@ -58,6 +58,21 @@ type encrypterFactory interface {
 	) (config.Encrypter, cmdStack.SecretsManagerState, error)
 }
 
+type configSetEncrypter struct {
+	fallback encrypterFactory
+	openKMS  func(context.Context, string) (cloud.ConfigKMSKeeper, error)
+}
+
+func (e configSetEncrypter) GetEncrypter(
+	ctx context.Context, s backend.Stack, ps *workspace.ProjectStack,
+) (config.Encrypter, cmdStack.SecretsManagerState, error) {
+	enc, err := cloud.NewConfigEncrypter(ctx, ps, e.openKMS)
+	if err != nil || enc != nil {
+		return enc, cmdStack.SecretsManagerUnchanged, err
+	}
+	return e.fallback.GetEncrypter(ctx, s, ps)
+}
+
 func NewConfigCmd(ws pkgWorkspace.Context) *cobra.Command {
 	var stack string
 	var configFile string
@@ -739,6 +754,8 @@ func newConfigRefreshCmd(
 }
 
 type configSetCmd struct {
+	openKMS func(context.Context, string) (cloud.ConfigKMSKeeper, error)
+
 	Stdin            *os.File
 	LoadProjectStack func(
 		context.Context, diag.Sink, *workspace.Project, backend.Stack, string,
@@ -901,7 +918,8 @@ func (c *configSetCmd) Run(
 	}
 
 	ssml := cmdStack.NewStackSecretsManagerLoaderFromEnv()
-	w, err := newConfigWriter(s, project.Name, ps, configFile, &ssml, c.OverrideImport)
+	encrypters := configSetEncrypter{fallback: &ssml, openKMS: c.openKMS}
+	w, err := newConfigWriter(s, project.Name, ps, configFile, encrypters, c.OverrideImport)
 	if err != nil {
 		return err
 	}

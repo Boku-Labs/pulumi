@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"testing"
 
@@ -38,6 +40,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -314,6 +317,115 @@ runtime: mock
 	val, err := cfgValue.Value(passphraseDecrypter)
 	require.NoError(t, err)
 	assert.Equal(t, "bar", val)
+}
+
+//nolint:paralleltest // Changes the working directory and config passphrase environment.
+func TestChangeSecretsProviderStagesConfigUntilV2MigrationSucceeds(t *testing.T) {
+	t.Setenv("PULUMI_CONFIG_PASSPHRASE", "synthetic replacement passphrase")
+	unwrapFailure := errors.New("KMS could not unwrap config data key")
+	for _, tc := range []struct {
+		name      string
+		unwrapErr error
+	}{
+		{name: "unwrap fails", unwrapErr: unwrapFailure},
+		{name: "success"},
+	} {
+		//nolint:paralleltest // Changes the working directory.
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			ctx := t.Context()
+			const stackPath = "Pulumi.testStack.yaml"
+			const oldCiphertext = "v2:wrapped:payload"
+			key := config.MustMakeKey("testProject", "nested")
+			original := []byte(`# stack config
+secretsprovider: gcpkms://projects/test
+encryptedkey: b2xkIGtleQ==
+config:
+  testProject:nested:
+    items:
+    - secure: v2:wrapped:payload
+    - plain
+`)
+			require.NoError(t, os.WriteFile("Pulumi.yaml", []byte("name: testProject\nruntime: mock\n"), 0o600))
+			require.NoError(t, os.WriteFile(stackPath, original, 0o600))
+			project, err := workspace.LoadProject("Pulumi.yaml")
+			require.NoError(t, err)
+			currentConfig, err := workspace.LoadProjectStack(cmdutil.Diag(), project, stackPath)
+			require.NoError(t, err)
+			oldValue := currentConfig.Config[key]
+
+			var exports, imports, unwraps int
+			originalManager := b64.NewBase64SecretsManager()
+			mockBackend := &backend.MockBackend{
+				ExportDeploymentF: func(ctx context.Context, _ backend.Stack) (*apitype.UntypedDeployment, error) {
+					exports++
+					persisted, err := workspace.LoadProjectStack(cmdutil.Diag(), project, stackPath)
+					require.NoError(t, err)
+					assert.NotEmpty(t, persisted.EncryptionSalt)
+					assert.NotEqual(t, oldValue, persisted.Config[key])
+					return stack.SerializeUntypedDeployment(ctx, &deploy.Snapshot{SecretsManager: originalManager}, nil)
+				},
+				ImportDeploymentF: func(context.Context, backend.Stack, *apitype.UntypedDeployment) error {
+					imports++
+					return nil
+				},
+			}
+			mockStack := &backend.MockStack{
+				BackendF: func() backend.Backend { return mockBackend },
+				RefF: func() backend.StackReference {
+					return &backend.MockStackReference{
+						NameV:               tokens.MustParseStackName("testStack"),
+						FullyQualifiedNameV: "organization/testProject/testStack",
+					}
+				},
+				ConfigLocationF: func() backend.StackConfigLocation { return backend.StackConfigLocation{} },
+			}
+
+			decrypter := stackConfigTestDecrypter(func(_ context.Context, ciphertexts []string) ([]string, error) {
+				unwraps++
+				assert.Equal(t, []string{oldCiphertext}, ciphertexts)
+				if tc.unwrapErr != nil {
+					return nil, tc.unwrapErr
+				}
+				return []string{"decrypted config"}, nil
+			})
+			err = migrateOldConfigAndCheckpointToNewSecretsProvider(
+				ctx, io.Discard, SecretsManagerLoader{}, b64.Base64SecretsProvider,
+				mockStack, currentConfig, decrypter, passphrase.Type, false,
+			)
+			assert.Equal(t, 1, unwraps)
+			assert.Equal(t, "gcpkms://projects/test", currentConfig.SecretsProvider)
+			assert.Equal(t, "b2xkIGtleQ==", currentConfig.EncryptedKey)
+			assert.Equal(t, oldValue, currentConfig.Config[key])
+			if tc.unwrapErr != nil {
+				require.ErrorIs(t, err, tc.unwrapErr)
+				actual, err := os.ReadFile(stackPath)
+				require.NoError(t, err)
+				assert.Equal(t, original, actual)
+				assert.Zero(t, exports)
+				assert.Zero(t, imports)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, 1, exports)
+			assert.Equal(t, 1, imports)
+			persisted, err := workspace.LoadProjectStack(cmdutil.Diag(), project, stackPath)
+			require.NoError(t, err)
+			assert.Empty(t, persisted.SecretsProvider)
+			assert.Empty(t, persisted.EncryptedKey)
+			require.NotEmpty(t, persisted.EncryptionSalt)
+			ciphertexts, err := persisted.Config[key].SecureValues(config.NopDecrypter)
+			require.NoError(t, err)
+			require.Len(t, ciphertexts, 1)
+			assert.Contains(t, ciphertexts[0], "v1:")
+			newManager, err := passphrase.NewPromptingPassphraseSecretsManager(persisted, false)
+			require.NoError(t, err)
+			plaintext, err := persisted.Config[key].Value(newManager.Decrypter())
+			require.NoError(t, err)
+			assert.JSONEq(t, `{"items":["decrypted config","plain"]}`, plaintext)
+		})
+	}
 }
 
 //nolint:paralleltest // mutates global state
