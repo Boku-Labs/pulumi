@@ -1,0 +1,118 @@
+name: Boku CLI release
+
+on:
+  push:
+    tags:
+      - 'v*-boku.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boku-cli-release-${{ github.ref }}
+
+jobs:
+  validate:
+    if: github.repository == 'Boku-Labs/pulumi' && !github.event.deleted
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release tag
+        id: tag
+        shell: bash
+        run: |
+          upstream_version=$(<sdk/.version)
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-boku\.[1-9][0-9]*$ ||
+                "${GITHUB_REF_NAME%-boku.*}" != "v$upstream_version" ]]; then
+            echo "::error::Expected a tag such as v$upstream_version-boku.1"
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/boku/patches; then
+            echo "::error::The tagged commit must be on boku/patches"
+            exit 1
+          fi
+
+          printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x64
+          - runner: macos-15
+            platform: darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.0'
+          cache-dependency-path: |
+            pkg/go.sum
+            sdk/go.sum
+            sdk/nodejs/cmd/pulumi-language-nodejs/go.sum
+      - name: Build and package CLI
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+          GOTOOLCHAIN: local
+          PLATFORM: ${{ matrix.platform }}
+          PULUMI_SKIP_UPDATE_CHECK: 'true'
+        run: |
+          dist="$RUNNER_TEMP/boku-cli"
+          mkdir -p "$dist/pulumi"
+          flags=(
+            -mod=readonly -trimpath -tags=osusergo,grpcnotrace
+            -ldflags="-s -w -X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=$GITHUB_REF_NAME"
+          )
+          go -C pkg build "${flags[@]}" -o "$dist/pulumi/pulumi" ./cmd/pulumi
+          go -C sdk/nodejs/cmd/pulumi-language-nodejs build "${flags[@]}" -o "$dist/pulumi/pulumi-language-nodejs" .
+          test "$("$dist/pulumi/pulumi" version)" = "$GITHUB_REF_NAME"
+          test "$("$dist/pulumi/pulumi-language-nodejs" -version)" = "$GITHUB_REF_NAME"
+          cp LICENSE "$dist/pulumi/"
+          tar -czf "$dist/pulumi-$GITHUB_REF_NAME-$PLATFORM.tar.gz" -C "$dist" pulumi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: boku-cli-${{ matrix.platform }}
+          path: ${{ runner.temp }}/boku-cli/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: boku-cli-*
+          merge-multiple: true
+      - name: Publish GitHub prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if [[ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)" != "$COMMIT" ]]; then
+            echo "::error::The release tag no longer points to the built commit"
+            exit 1
+          fi
+
+          assets=("pulumi-$tag-linux-x64.tar.gz" "pulumi-$tag-darwin-arm64.tar.gz")
+          sha256sum "${assets[@]}" > SHA256SUMS
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+            --title "Boku Pulumi $tag" --notes "Built from boku/patches commit $COMMIT." \
+            "${assets[@]}" SHA256SUMS
