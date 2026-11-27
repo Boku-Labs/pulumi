@@ -20,6 +20,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	netUrl "net/url"
 	"os"
@@ -89,26 +90,53 @@ func generateNewDataKey(url string) ([]byte, error) {
 	return keeper.Encrypt(context.Background(), plaintextDataKey)
 }
 
+// OpenCloudSecretsManager opens the key recorded in stack configuration.
+func OpenCloudSecretsManager(ctx context.Context, ps *workspace.ProjectStack) (secrets.Manager, error) {
+	if ps == nil || ps.SecretsProvider == "" || ps.EncryptedKey == "" {
+		return nil, errors.New("stack configuration has no wrapped cloud secrets key")
+	}
+	key, err := base64.StdEncoding.DecodeString(ps.EncryptedKey)
+	if err != nil {
+		return nil, fmt.Errorf("decoding wrapped stack key: %w", err)
+	}
+	return openCloudSecretsManager(ctx, ps.SecretsProvider, key)
+}
+
 // newCloudSecretsManager returns a secrets manager that uses the target cloud key management
 // service to encrypt/decrypt a data key used for envelope encryption of secrets values.
 func newCloudSecretsManager(url string, encryptedDataKey []byte) (*Manager, error) {
-	keeper, err := openKeeper(context.Background(), url)
+	return openCloudSecretsManager(context.Background(), url, encryptedDataKey)
+}
+
+func openCloudSecretsManager(ctx context.Context, url string, encryptedDataKey []byte) (*Manager, error) {
+	keeper, err := openKeeper(ctx, url)
 	if err != nil {
 		return nil, err
 	}
+	return newCloudSecretsManagerWithKeeper(ctx, url, encryptedDataKey, keeper)
+}
+
+func newCloudSecretsManagerWithKeeper(
+	ctx context.Context, url string, encryptedDataKey []byte, keeper *gosecrets.Keeper,
+) (*Manager, error) {
 	// We're emulating gocloud.dev's old behaviour here. Pre v0.28.0 it used to have an inner wrapping, which
 	// we keep for compatibility (see above). However the newer version expects this to be unwrapped, before
 	// it's used, so let's do that here.
 	ciphertext := encryptedDataKey
 	if strings.HasPrefix(url, "azurekeyvault://") {
-		ciphertext, err = base64.RawURLEncoding.DecodeString(string(encryptedDataKey))
+		decoded, err := base64.RawURLEncoding.DecodeString(string(encryptedDataKey))
 		if err != nil {
 			return nil, err
 		}
+		ciphertext = decoded
 	}
-	plaintextDataKey, err := keeper.Decrypt(context.Background(), ciphertext)
+	plaintextDataKey, err := keeper.Decrypt(ctx, ciphertext)
 	if err != nil {
 		return nil, err
+	}
+	if len(plaintextDataKey) != config.SymmetricCrypterKeyBytes {
+		return nil, fmt.Errorf("invalid stack data key length: got %d bytes, want %d",
+			len(plaintextDataKey), config.SymmetricCrypterKeyBytes)
 	}
 	state, err := json.Marshal(cloudSecretsManagerState{
 		URL:          url,

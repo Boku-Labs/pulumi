@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -34,11 +33,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/pulumi/pulumi/pkg/v3/backend"
-	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	backend_secrets "github.com/pulumi/pulumi/pkg/v3/backend/secrets"
 	cmdBackend "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/backend"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/cmd"
-	cmdStack "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/stack"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/ui"
 	"github.com/pulumi/pulumi/pkg/v3/engine/encryptedlog"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
@@ -52,6 +49,7 @@ import (
 
 func newDecryptCmd(ws pkgWorkspace.Context) *cobra.Command {
 	var latest bool
+	var configFile string
 	command := &cobra.Command{
 		Use:   "decrypt [filename]",
 		Short: "Decrypt and display automatic logs",
@@ -106,7 +104,11 @@ func newDecryptCmd(ws pkgWorkspace.Context) *cobra.Command {
 			defer out.Flush()
 
 			if string(magic[:]) == encryptedlog.Magic {
-				return decryptPLOG(cmd, ws, stackName, f, out)
+				reader, err := openStackLog(cmd.Context(), ws, stackName, configFile, f)
+				if err != nil {
+					return err
+				}
+				return formatLogRecords(reader, out, false)
 			}
 
 			gz, err := gzip.NewReader(f)
@@ -119,50 +121,12 @@ func newDecryptCmd(ws pkgWorkspace.Context) *cobra.Command {
 		},
 	}
 
+	command.Flags().StringVar(&configFile, "config-file", "",
+		"Use the cloud secrets key from this stack configuration file")
 	command.Flags().BoolVar(&latest, "latest", false,
 		"Decrypt the most recent log file without prompting")
 
 	return command
-}
-
-// decryptPLOG decrypts an encrypted PLOG log file. The stack name is
-// parsed from the filename, or overridden with --stack. The secrets
-// provider is read from the stack's deployment, so no project directory
-// is needed.
-func decryptPLOG(
-	cmd *cobra.Command, ws pkgWorkspace.Context,
-	stackName string, f *os.File, out io.Writer,
-) error {
-	ctx := cmd.Context()
-
-	if stackName == "" {
-		stackName = stackNameFromFilename(filepath.Base(f.Name()))
-	}
-	if stackName == "" {
-		return fmt.Errorf("cannot determine stack from filename %q; use --stack to specify", filepath.Base(f.Name()))
-	}
-
-	opts := display.Options{Color: cmdutil.GetGlobalColorization()}
-	s, err := cmdStack.RequireStack(
-		ctx, cmdutil.Diag(), ws,
-		cmdBackend.DefaultLoginManager,
-		stackName, cmdStack.LoadOnly, opts, "",
-	)
-	if err != nil {
-		return fmt.Errorf("loading stack %q for decryption: %w", stackName, err)
-	}
-
-	sm, err := secretsManagerFromStack(ctx, s)
-	if err != nil {
-		return fmt.Errorf("getting secrets manager for stack %q: %w", stackName, err)
-	}
-
-	reader, err := encryptedlog.NewReader(ctx, f, sm.Decrypter())
-	if err != nil {
-		return fmt.Errorf("decrypting log: %w", err)
-	}
-
-	return formatLogRecords(reader, out, false)
 }
 
 // stackNameFromFilename extracts the stack name from a log filename.
