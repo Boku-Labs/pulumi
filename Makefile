@@ -232,7 +232,7 @@ lint_golang_fix: GOLANGCI_LINT_ARGS=--fix
 lint_golang_fix: lint_golang
 
 lint_actions:
-	go run github.com/rhysd/actionlint/cmd/actionlint@v1.6.27 \
+	go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 \
 	  -format '{{range $$err := .}}### Error at line {{$$err.Line}}, col {{$$err.Column}} of `{{$$err.Filepath}}`\n\n{{$$err.Message}}\n\n```\n{{$$err.Snippet}}\n```\n\n{{end}}'
 
 format:: ensure

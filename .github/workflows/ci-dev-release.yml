@@ -198,7 +198,6 @@ jobs:
         with:
           node-version: ${{ fromJson(needs.matrix.outputs.version-set).nodejs }}
           registry-url: https://registry.npmjs.org
-          always-auth: true
         env:
           NODE_AUTH_TOKEN: ${{ steps.esc-secrets.outputs.NPM_TOKEN }}
           NPM_TOKEN: ${{ steps.esc-secrets.outputs.NPM_TOKEN }}

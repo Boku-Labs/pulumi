@@ -58,10 +58,7 @@ jobs:
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: '1.27.0'
-          cache-dependency-path: |
-            pkg/go.sum
-            sdk/go.sum
-            sdk/nodejs/cmd/pulumi-language-nodejs/go.sum
+          cache: false
       - name: Build and package CLI
         shell: bash
         env:
@@ -73,7 +70,7 @@ jobs:
           dist="$RUNNER_TEMP/boku-cli"
           mkdir -p "$dist/pulumi"
           flags=(
-            -mod=readonly -trimpath -tags=osusergo,grpcnotrace
+            -mod=readonly -trimpath '-tags=osusergo,grpcnotrace'
             -ldflags="-s -w -X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=$GITHUB_REF_NAME"
           )
           go -C pkg build "${flags[@]}" -o "$dist/pulumi/pulumi" ./cmd/pulumi
@@ -94,24 +91,37 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: boku-cli-*
           merge-multiple: true
-      - name: Publish GitHub prerelease
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            pulumi-${{ github.ref_name }}-linux-x64.tar.gz
+            pulumi-${{ github.ref_name }}-darwin-arm64.tar.gz
+      - name: Verify and publish GitHub prerelease
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           COMMIT: ${{ needs.validate.outputs.commit }}
         run: |
           tag="$GITHUB_REF_NAME"
-          if [[ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)" != "$COMMIT" ]]; then
+          if [[ "$(gh api "repos/$GITHUB_REPOSITORY/commits/tags%2F$tag" --jq .sha)" != "$COMMIT" ]]; then
             echo "::error::The release tag no longer points to the built commit"
             exit 1
           fi
 
           assets=("pulumi-$tag-linux-x64.tar.gz" "pulumi-$tag-darwin-arm64.tar.gz")
+          for asset in "${assets[@]}"; do
+            gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/boku-release.yml" \
+              --source-ref "$GITHUB_REF" --source-digest "$COMMIT"
+          done
           sha256sum "${assets[@]}" > SHA256SUMS
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
             --title "Boku Pulumi $tag" --notes "Built from boku/patches commit $COMMIT." \
