@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,6 +33,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	"github.com/pulumi/pulumi/pkg/v3/secrets/cloud"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
@@ -565,6 +567,71 @@ func TestConfigSet(t *testing.T) {
 			require.Equal(t, c.expected, string(data))
 		})
 	}
+}
+
+func TestConfigSetSecretPreservesInitializedKMSMetadata(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	const provider = "gcpkms://projects/example/locations/global/keyRings/test/cryptoKeys/test"
+	wrappedKey := base64.StdEncoding.EncodeToString([]byte("existing wrapped key"))
+	legacy := config.MustMakeKey("testProject", "legacy")
+	ps := &workspace.ProjectStack{
+		SecretsProvider: provider,
+		EncryptedKey:    wrappedKey,
+		Config:          config.Map{legacy: config.NewSecureValue("v1:existing")},
+	}
+	s := &backend.MockStack{
+		RefF: func() backend.StackReference {
+			return &backend.MockStackReference{FullyQualifiedNameV: "org/testProject/testStack"}
+		},
+		ConfigLocationF: func() backend.StackConfigLocation { return backend.StackConfigLocation{} },
+	}
+
+	var kmsOpens int
+	set := &configSetCmd{
+		Secret: true,
+		LoadProjectStack: func(
+			context.Context, diag.Sink, *workspace.Project, backend.Stack, string,
+		) (*workspace.ProjectStack, error) {
+			return ps, nil
+		},
+		openKMS: func(_ context.Context, url string) (cloud.ConfigKMSKeeper, error) {
+			require.Equal(t, provider, url)
+			kmsOpens++
+			return encryptOnlyTestKeeper{t: t}, nil
+		},
+	}
+	configFile := filepath.Join(t.TempDir(), "Pulumi.stack.yaml")
+	project := &workspace.Project{Name: "testProject"}
+	ws := &pkgWorkspace.MockContext{}
+	require.NoError(t, set.Run(ctx, ws, []string{"testProject:secret", "new secret"}, project, s, configFile))
+	assert.Equal(t, 1, kmsOpens)
+
+	saved, err := workspace.LoadProjectStack(cmdutil.Diag(), project, configFile)
+	require.NoError(t, err)
+	assert.Equal(t, provider, saved.SecretsProvider)
+	assert.Equal(t, wrappedKey, saved.EncryptedKey)
+	assert.Equal(t, config.NewSecureValue("v1:existing"), saved.Config[legacy])
+	secret := saved.Config[config.MustMakeKey("testProject", "secret")]
+	assert.True(t, secret.Secure())
+	ciphertext, err := secret.Value(config.NopDecrypter)
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(ciphertext, "v2:"))
+}
+
+type encryptOnlyTestKeeper struct {
+	t *testing.T
+}
+
+func (k encryptOnlyTestKeeper) Encrypt(_ context.Context, key []byte) ([]byte, error) {
+	require.Len(k.t, key, config.SymmetricCrypterKeyBytes)
+	return []byte("wrapped data key"), nil
+}
+
+func (k encryptOnlyTestKeeper) Decrypt(context.Context, []byte) ([]byte, error) {
+	k.t.Error("config writer must only call KMS Encrypt")
+	return nil, errors.New("KMS Decrypt denied")
 }
 
 func TestConfigSetTypes(t *testing.T) {

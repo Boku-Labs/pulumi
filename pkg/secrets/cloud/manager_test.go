@@ -17,6 +17,7 @@ package cloud
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"math/big"
 	"net/url"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -110,6 +112,56 @@ func TestSecretsProviderOverride(t *testing.T) {
 		_, createSecretsManagerError = NewCloudSecretsManager(stackConfig, "test://bar", false)
 		assert.Nil(t, createSecretsManagerError, msg)
 	})
+}
+
+func TestGCPKMSOverridePreservesWrappedStackKey(t *testing.T) {
+	configured := strings.Replace(testGCPKMSURL, "gcpkms", "GcpKms", 1)
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", testGCPKMSURL+"/")
+	assert.Equal(t, configured, effectiveCloudSecretsProvider(configured))
+
+	keeper := newConfigTestKeeper(t)
+	_, wrapped, err := newWrappedDataKey(t.Context(), keeper)
+	require.NoError(t, err)
+	ps := &workspace.ProjectStack{
+		SecretsProvider: configured,
+		EncryptedKey:    base64.StdEncoding.EncodeToString(wrapped),
+	}
+	enc, err := NewConfigEncrypter(t.Context(), ps, func(_ context.Context, provider string) (ConfigKMSKeeper, error) {
+		assert.Equal(t, configured, provider)
+		return keeper, nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, enc)
+	ciphertext, err := enc.EncryptValue(t.Context(), "config value")
+	require.NoError(t, err)
+
+	keeper.allowDecrypt = true
+	sm, err := newCloudSecretsManagerWithKeeper(t.Context(), configured, wrapped, keeper)
+	require.NoError(t, err)
+	plaintext, err := sm.Decrypter().DecryptValue(t.Context(), ciphertext)
+	require.NoError(t, err)
+	assert.Equal(t, "config value", plaintext)
+}
+
+func TestCloudSecretsManagerRefusesImplicitGCPKMSRekey(t *testing.T) {
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", testGCPKMSURL+"-other")
+	ps := &workspace.ProjectStack{
+		SecretsProvider: testGCPKMSURL,
+		EncryptedKey:    base64.StdEncoding.EncodeToString([]byte("existing key")),
+		Config: config.Map{
+			config.MustMakeKey("test", "secret"): config.NewSecureValue("existing ciphertext"),
+		},
+	}
+	original := *ps
+	_, err := NewCloudSecretsManager(ps, ps.SecretsProvider, false)
+	require.ErrorContains(t, err, "cannot replace the wrapped stack key")
+	assert.Equal(t, original, *ps)
+
+	ps.EncryptedKey = ""
+	t.Setenv("PULUMI_CLOUD_SECRET_OVERRIDE", "")
+	_, err = NewCloudSecretsManager(ps, ps.SecretsProvider, false)
+	require.ErrorContains(t, err, "cannot replace the wrapped stack key")
+	assert.Empty(t, ps.EncryptedKey)
 }
 
 type mockSecretsKeeperOpener struct {

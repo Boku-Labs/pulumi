@@ -20,9 +20,9 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	netUrl "net/url"
-	"os"
 	"strings"
 
 	gosecrets "gocloud.dev/secrets"
@@ -92,23 +92,35 @@ func generateNewDataKey(url string) ([]byte, error) {
 // newCloudSecretsManager returns a secrets manager that uses the target cloud key management
 // service to encrypt/decrypt a data key used for envelope encryption of secrets values.
 func newCloudSecretsManager(url string, encryptedDataKey []byte) (*Manager, error) {
-	keeper, err := openKeeper(context.Background(), url)
+	ctx := context.Background()
+	keeper, err := openKeeper(ctx, url)
 	if err != nil {
 		return nil, err
 	}
+	return newCloudSecretsManagerWithKeeper(ctx, url, encryptedDataKey, keeper)
+}
+
+func newCloudSecretsManagerWithKeeper(
+	ctx context.Context, url string, encryptedDataKey []byte, keeper dataKeyUnwrapper,
+) (*Manager, error) {
 	// We're emulating gocloud.dev's old behaviour here. Pre v0.28.0 it used to have an inner wrapping, which
 	// we keep for compatibility (see above). However the newer version expects this to be unwrapped, before
 	// it's used, so let's do that here.
 	ciphertext := encryptedDataKey
 	if strings.HasPrefix(url, "azurekeyvault://") {
-		ciphertext, err = base64.RawURLEncoding.DecodeString(string(encryptedDataKey))
+		decoded, err := base64.RawURLEncoding.DecodeString(string(encryptedDataKey))
 		if err != nil {
 			return nil, err
 		}
+		ciphertext = decoded
 	}
-	plaintextDataKey, err := keeper.Decrypt(context.Background(), ciphertext)
+	plaintextDataKey, err := keeper.Decrypt(ctx, ciphertext)
 	if err != nil {
 		return nil, err
+	}
+	if len(plaintextDataKey) != config.SymmetricCrypterKeyBytes {
+		return nil, fmt.Errorf("invalid stack data key length: got %d bytes, want %d",
+			len(plaintextDataKey), config.SymmetricCrypterKeyBytes)
 	}
 	state, err := json.Marshal(cloudSecretsManagerState{
 		URL:          url,
@@ -118,7 +130,11 @@ func newCloudSecretsManager(url string, encryptedDataKey []byte) (*Manager, erro
 		return nil, fmt.Errorf("marshalling state: %w", err)
 	}
 	crypter := config.NewSymmetricCrypter(plaintextDataKey)
-	cachedCrypter := config.NewCiphertextToPlaintextCachedCrypter(crypter, crypter)
+	var decrypter config.Decrypter = crypter
+	if parseGCPKMSProvider(url) != nil {
+		decrypter = gcpConfigDecrypter{legacy: crypter, keeper: keeper, stackKey: encryptedDataKey}
+	}
+	cachedCrypter := config.NewCiphertextToPlaintextCachedCrypter(crypter, decrypter)
 	return &Manager{
 		crypter: cachedCrypter,
 		state:   state,
@@ -188,19 +204,22 @@ func NewCloudSecretsManagerFromState(state json.RawMessage) (secrets.Manager, er
 func NewCloudSecretsManager(info *workspace.ProjectStack,
 	secretsProvider string, rotateSecretsProvider bool,
 ) (secrets.Manager, error) {
+	// V2 ciphertext is bound to the wrapped stack key. Replacing its key
+	// requires an explicit provider change or rotation.
+	provider := effectiveCloudSecretsProvider(secretsProvider)
+	if !rotateSecretsProvider && secretsProvider == info.SecretsProvider &&
+		parseGCPKMSProvider(secretsProvider) != nil &&
+		(info.EncryptedKey == "" || provider != secretsProvider) && info.Config.HasSecureValue() {
+		return nil, errors.New("cannot replace the wrapped stack key while encrypted configuration exists")
+	}
+	secretsProvider = provider
+
 	// Only a passphrase provider has an encryption salt. So changing a secrets provider
 	// from passphrase to a cloud secrets provider should ensure that we remove the enryptionsalt
 	// as it's a legacy artifact and needs to be removed
 	info.EncryptionSalt = ""
 
 	var secretsManager *Manager
-
-	// Allow per-execution override of the secrets provider via an environment
-	// variable. This allows a temporary replacement without updating the stack
-	// config, such a during CI.
-	if override := os.Getenv("PULUMI_CLOUD_SECRET_OVERRIDE"); override != "" {
-		secretsProvider = override
-	}
 
 	// If we're rotating then just clear the key so we create a fresh one below
 	if rotateSecretsProvider {
