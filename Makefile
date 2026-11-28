@@ -231,8 +231,10 @@ lint_golang: $(CUSTOM_GCL)
 lint_golang_fix: GOLANGCI_LINT_ARGS=--fix
 lint_golang_fix: lint_golang
 
+# The inherited release workflows still pass setup-node's removed always-auth input.
 lint_actions:
-	go run github.com/rhysd/actionlint/cmd/actionlint@v1.6.27 \
+	go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 \
+	  -ignore 'input "always-auth" is not defined in action "actions/setup-node@v6"' \
 	  -format '{{range $$err := .}}### Error at line {{$$err.Line}}, col {{$$err.Column}} of `{{$$err.Filepath}}`\n\n{{$$err.Message}}\n\n```\n{{$$err.Snippet}}\n```\n\n{{end}}'
 
 format:: ensure
