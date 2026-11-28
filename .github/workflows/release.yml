@@ -91,6 +91,7 @@ jobs:
         with:
           node-version: ${{ fromJson(inputs.version-set).nodejs }}
           registry-url: https://registry.npmjs.org
+          always-auth: true
       - name: Download release artifacts
         if: ${{ matrix.language != 'go' }}
         run: |
@@ -126,6 +127,7 @@ jobs:
         with:
           node-version: ${{ fromJson(inputs.version-set).nodejs }}
           registry-url: https://registry.npmjs.org
+          always-auth: true
       - name: Download release artifacts
         run: |
           mkdir -p artifacts
